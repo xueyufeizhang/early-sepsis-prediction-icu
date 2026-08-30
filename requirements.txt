@@ -1,0 +1,41 @@
+# Early Sepsis Prediction in ICU Patients — Python dependencies
+#
+# Local development is managed by uv (pyproject.toml + uv.lock are the source
+# of truth — run `uv sync`). This file is kept for Kaggle/Colab, which use pip.
+# Regenerate it from the locked environment with:
+#     uv export --no-hashes --no-dev --format requirements-txt > requirements.txt
+#
+# Most of these are pre-installed on Kaggle / Colab. Pins are lower-bounds
+# (>=) for reproducibility without breaking the managed notebook environments.
+
+# --- Core data stack ---
+numpy>=1.26
+pandas>=2.1
+scipy>=1.11            # statistical tests: Wilcoxon, paired t-test, DeLong helper
+
+# --- Classic ML ---
+scikit-learn>=1.4      # LR, SVM, RandomForest, MLP, metrics, GroupKFold
+xgboost>=2.0           # strong tabular baseline (reference paper)
+imbalanced-learn>=0.12 # SMOTE (train fold only)
+
+# --- Deep learning (LSTM + MLP) ---
+# Pick ONE stack. Default to PyTorch; comment out if using TF/Keras instead.
+torch>=2.2
+# tensorflow>=2.15
+
+# --- Interpretability ---
+shap>=0.44
+
+# --- Plots ---
+matplotlib>=3.8
+seaborn>=0.13
+
+# --- Data access (PhysioNet via BigQuery, per brief Section 3) ---
+google-cloud-bigquery>=3.17
+db-dtypes>=1.2         # BigQuery -> pandas dtype support
+pyarrow>=14.0          # parquet I/O for intermediate cohort/feature tables
+
+# --- Utilities ---
+pyyaml>=6.0
+tqdm>=4.66
+jupyter>=1.0

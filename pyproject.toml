@@ -9,26 +9,19 @@ requires-python = ">=3.11,<3.13"
 # Kaggle/Colab, which use pip). Lower-bound (>=) pins so resolution stays
 # compatible with the managed notebook environments. See brief Section 12.
 dependencies = [
-    # --- Core data stack ---
     "numpy>=1.26",
     "pandas>=2.1",
-    "scipy>=1.11",            # statistical tests: Wilcoxon, paired t-test, DeLong helper
-    # --- Classic ML ---
-    "scikit-learn>=1.4",      # LR, SVM, RandomForest, MLP, metrics, GroupKFold
-    "xgboost>=2.0",           # strong tabular baseline (reference paper)
-    "imbalanced-learn>=0.12", # SMOTE (train fold only)
-    # --- Deep learning (LSTM + MLP) ---
-    "torch>=2.2",             # CPU wheels locally; real GPU training on Kaggle
-    # --- Interpretability ---
+    "scipy>=1.11",
+    "scikit-learn>=1.4",
+    "xgboost>=2.0",
+    "imbalanced-learn>=0.12",
+    "torch>=2.2",
     "shap>=0.44",
-    # --- Plots ---
     "matplotlib>=3.8",
     "seaborn>=0.13",
-    # --- Data access (PhysioNet via BigQuery, brief Section 3) ---
     "google-cloud-bigquery>=3.17",
-    "db-dtypes>=1.2",         # BigQuery -> pandas dtype support
-    "pyarrow>=14.0",          # parquet I/O for intermediate cohort/feature tables
-    # --- Utilities ---
+    "db-dtypes>=1.2",
+    "pyarrow>=14.0",
     "pyyaml>=6.0",
     "tqdm>=4.66",
 ]

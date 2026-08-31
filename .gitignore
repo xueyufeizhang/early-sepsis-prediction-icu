@@ -7,6 +7,8 @@
 
 # --- Raw / derived patient data (never commit) ---
 *.csv
+# This one exact file contains only aggregate cohort-flow counts for slides.
+!results/tables/consort_counts.csv
 *.parquet
 *.feather
 *.pkl
@@ -17,11 +19,8 @@
 *.hdf5
 *.sqlite
 *.db
-data/raw/*
-data/interim/*
-data/processed/*
-data/external/*
-!data/**/.gitkeep
+# Keep the entire protected data workspace out of version control.
+data/
 
 # --- Credentials / secrets ---
 .env

@@ -87,12 +87,14 @@ access with your own credentialed account (do not commit credentials).
 
 ## Pipeline status
 
-**Stage 0 is complete; Stage 1 has started.** The seven task decisions are locked
+**Stage 0 is complete; Stage 1 is ready to run.** The seven task decisions are locked
 in `src/config.py` (including N=6h and M=24h), and the validated MIT-LCP
 `sepsis3.sql` plus its `suspicion_of_infection.sql` dependency are present in
-`sql/` and have been reviewed.
+`sql/` and have been reviewed. The parameterized MIMIC-IV cohort/CONSORT SQL,
+Python orchestration, leakage checks, synthetic boundary tests, and a clean
+execution notebook are implemented.
 
-The next executable step is to implement the MIMIC-IV cohort query/orchestration,
-run it in the user's credentialed BigQuery environment, and produce the audited
-CONSORT-style patient-flow counts. No cohort extract, feature matrix, trained
-model, evaluation result, or completed presentation exists yet.
+The remaining Stage-1 step is to run `notebooks/01_cohort.ipynb` in the user's
+credentialed BigQuery environment and review the protected audit sample plus the
+aggregate CONSORT counts. No real cohort extract, feature matrix, trained model,
+evaluation result, or completed presentation exists yet.

@@ -20,8 +20,12 @@ Query outputs (cohort tables, extracts) are patient-level data → keep them und
   against the current `main` version on 2026-08-30.
 - `suspicion_of_infection.sql`: required upstream dependency, reviewed against
   the current `main` version on 2026-08-30.
-- These are reference/derived-concept definitions, **not** the project cohort
-  query. Cohort windowing and label assignment still need to be implemented.
+- `cohort_mimiciv.sql`: project cohort query using the materialized validated
+  concept plus adult, patient-level first-stay and `(N, N+M]` window rules.
+- `consort_mimiciv.sql`: matching aggregate patient-flow query.
+
+The project queries use named BigQuery parameters supplied by `src/cohort.py`.
+They do not contain credentials or patient data.
 
 Upstream sources:
 - https://github.com/MIT-LCP/mimic-code/blob/main/mimic-iv/concepts/sepsis/sepsis3.sql

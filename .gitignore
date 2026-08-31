@@ -21,7 +21,7 @@
 data/
 
 # --- Outputs derived from protected clinical data (never commit) ---
-/results/
+results/
 
 # --- Credentials / secrets ---
 .env

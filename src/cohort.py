@@ -5,9 +5,9 @@ The validated Sepsis-3 definition is read from the materialized
 project-specific adult/first-stay/window rules; it does not recreate SOFA or
 suspected-infection logic.
 
-Patient-level outputs must stay in a PhysioNet-approved environment and under
-the gitignored ``data/`` tree. Only aggregate CONSORT counts and figures are
-intended for ``results/``.
+Patient-level outputs must stay in a PhysioNet-approved environment. Generated
+data and result artifacts remain local under the gitignored ``data/`` and
+``results/`` trees.
 """
 
 from __future__ import annotations
@@ -39,18 +39,6 @@ SOURCE_PROJECT = "physionet-data"
 COHORT_SQL_FILE = SQL_DIR / "cohort_mimiciv.sql"
 CONSORT_SQL_FILE = SQL_DIR / "consort_mimiciv.sql"
 
-BASE_REQUIRED_COLUMNS = {
-    "subject_id",
-    "stay_id",
-    "hadm_id",
-    "intime",
-    "outtime",
-    "age",
-    "gender",
-    "race",
-    "sepsis_onset_time",
-}
-
 FINAL_COLUMNS = [
     "subject_id",
     "stay_id",
@@ -67,16 +55,6 @@ FINAL_COLUMNS = [
     "onset_offset_h",
     "label",
 ]
-
-CONSORT_STAGE_LABELS = {
-    "all_icu_stays": "All ICU stays",
-    "adult_stays": f"Adults (age >= {AGE_MIN})",
-    "first_icu_stays": "First ICU stay per patient",
-    "prediction_eligible": f"No Sepsis-3 onset by hour {N_HOURS}",
-    "final_cohort": "Final labeled cohort",
-    "positive": f"Positive: onset in ({N_HOURS}, {N_HOURS + M_HOURS}] h",
-    "negative": f"Negative: no onset in [0, {N_HOURS + M_HOURS}] h",
-}
 
 
 @dataclass(frozen=True)
@@ -170,128 +148,6 @@ def load_consort_counts(
     sql = render_stage1_sql(CONSORT_SQL_FILE, source_project)
     counts = client.query(sql, job_config=build_query_job_config()).to_dataframe()
     return counts.sort_values("stage_order", kind="stable").reset_index(drop=True)
-
-
-def apply_window_labels(
-    stays: pd.DataFrame,
-    *,
-    n_hours: int = N_HOURS,
-    m_hours: int = M_HOURS,
-    age_min: int = AGE_MIN,
-    first_icu_stay_only: bool = FIRST_ICU_STAY_ONLY,
-) -> pd.DataFrame:
-    """Apply the project label rules to an in-memory base-stay table.
-
-    This pure-Python implementation mirrors ``sql/cohort_mimiciv.sql`` and is
-    primarily used for boundary tests and protected local audits.
-    """
-
-    _require_columns(stays, BASE_REQUIRED_COLUMNS)
-    if n_hours <= 0 or m_hours <= 0:
-        raise ValueError("n_hours and m_hours must both be positive")
-
-    upper = n_hours + m_hours
-    frame = stays.copy()
-    frame["intime"] = pd.to_datetime(frame["intime"])
-    frame["outtime"] = pd.to_datetime(frame["outtime"])
-    frame["sepsis_onset_time"] = pd.to_datetime(frame["sepsis_onset_time"])
-    frame["los_hours"] = (frame["outtime"] - frame["intime"]).dt.total_seconds() / 3600.0
-    frame["onset_offset_h"] = (
-        frame["sepsis_onset_time"] - frame["intime"]
-    ).dt.total_seconds() / 3600.0
-    frame["feature_window_end"] = frame["intime"] + pd.to_timedelta(n_hours, unit="h")
-    frame["prediction_window_end"] = frame["intime"] + pd.to_timedelta(upper, unit="h")
-
-    adult = frame["age"].ge(age_min)
-    first_stay = frame["first_icu_stay"].fillna(False).astype(bool)
-    if not first_icu_stay_only:
-        first_stay = pd.Series(True, index=frame.index)
-
-    offset = frame["onset_offset_h"]
-    positive = (
-        adult & first_stay & frame["los_hours"].ge(n_hours) & offset.gt(n_hours) & offset.le(upper)
-    )
-    negative = (
-        adult & first_stay & frame["los_hours"].ge(upper) & (offset.isna() | offset.gt(upper))
-    )
-
-    frame["label"] = pd.Series(pd.NA, index=frame.index, dtype="Int8")
-    frame.loc[positive, "label"] = 1
-    frame.loc[negative, "label"] = 0
-
-    reason = pd.Series("eligible", index=frame.index, dtype="string")
-    reason.loc[~adult] = "underage"
-    reason.loc[adult & ~first_stay] = "not_first_icu_stay"
-    in_scope = adult & first_stay
-    reason.loc[in_scope & offset.notna() & offset.le(n_hours)] = "onset_at_or_before_n"
-    reason.loc[
-        in_scope
-        & frame["label"].isna()
-        & ~(offset.notna() & offset.le(n_hours))
-        & frame["los_hours"].lt(upper)
-    ] = "insufficient_follow_up"
-    frame["exclusion_reason"] = reason
-    return frame
-
-
-def build_cohort(stays: pd.DataFrame, **label_kwargs: Any) -> pd.DataFrame:
-    """Apply labels and return only eligible rows in the canonical schema."""
-
-    labeled = apply_window_labels(stays, **label_kwargs)
-    cohort = labeled.loc[labeled["label"].notna(), FINAL_COLUMNS].copy()
-    cohort["label"] = cohort["label"].astype("int8")
-    cohort = cohort.sort_values(["subject_id", "intime", "stay_id"], kind="stable")
-    return cohort.reset_index(drop=True)
-
-
-def consort_counts(
-    stays: pd.DataFrame,
-    *,
-    n_hours: int = N_HOURS,
-    m_hours: int = M_HOURS,
-    age_min: int = AGE_MIN,
-    first_icu_stay_only: bool = FIRST_ICU_STAY_ONLY,
-) -> pd.DataFrame:
-    """Compute aggregate flow counts from a protected in-memory base table."""
-
-    frame = apply_window_labels(
-        stays,
-        n_hours=n_hours,
-        m_hours=m_hours,
-        age_min=age_min,
-        first_icu_stay_only=first_icu_stay_only,
-    )
-    adult = frame["age"].ge(age_min)
-    first = adult & (
-        frame["first_icu_stay"].fillna(False).astype(bool) if first_icu_stay_only else True
-    )
-    prediction_eligible = first & (
-        frame["onset_offset_h"].isna() | frame["onset_offset_h"].gt(n_hours)
-    )
-    final = frame["label"].notna()
-
-    stages = [
-        (1, "all_icu_stays", pd.Series(True, index=frame.index)),
-        (2, "adult_stays", adult),
-        (3, "first_icu_stays", first),
-        (4, "prediction_eligible", prediction_eligible),
-        (5, "final_cohort", final),
-        (6, "positive", frame["label"].eq(1)),
-        (7, "negative", frame["label"].eq(0)),
-    ]
-    rows = []
-    for order, code, mask in stages:
-        subset = frame.loc[mask]
-        rows.append(
-            {
-                "stage_order": order,
-                "stage_code": code,
-                "stage_label": CONSORT_STAGE_LABELS[code],
-                "stay_count": int(len(subset)),
-                "subject_count": int(subset["subject_id"].nunique()),
-            }
-        )
-    return pd.DataFrame(rows)
 
 
 def validate_cohort(

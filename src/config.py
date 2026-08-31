@@ -31,7 +31,7 @@ M_HOURS = 24
 AGE_MIN = 18         # adult ICU patients only
 
 # Sepsis-3 onset timestamp used to bucket patients — decision #3 (confirmed).
-# Column from mimiciv_derived.sepsis3; the clinically-anchored "suspicion" time.
+# Column from mimiciv_3_1_derived.sepsis3; the clinically-anchored "suspicion" time.
 SEPSIS_ONSET_TIME_COL = "suspected_infection_time"
 
 # Cohort granularity — decision #5 (confirmed): one row per patient, first ICU

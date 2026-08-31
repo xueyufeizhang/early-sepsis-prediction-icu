@@ -12,7 +12,7 @@ WITH ranked_icu AS (
             PARTITION BY subject_id
             ORDER BY intime, stay_id
         ) AS patient_icu_seq
-    FROM `{{SOURCE_PROJECT}}.mimiciv_icu.icustays`
+    FROM `{{SOURCE_PROJECT}}.mimiciv_3_1_icu.icustays`
 ),
 
 base AS (
@@ -39,11 +39,11 @@ base AS (
             SECOND
         ) / 3600.0 AS onset_offset_h
     FROM ranked_icu AS icu
-    INNER JOIN `{{SOURCE_PROJECT}}.mimiciv_hosp.patients` AS patients
+    INNER JOIN `{{SOURCE_PROJECT}}.mimiciv_3_1_hosp.patients` AS patients
         USING (subject_id)
-    INNER JOIN `{{SOURCE_PROJECT}}.mimiciv_hosp.admissions` AS admissions
+    INNER JOIN `{{SOURCE_PROJECT}}.mimiciv_3_1_hosp.admissions` AS admissions
         USING (subject_id, hadm_id)
-    LEFT JOIN `{{SOURCE_PROJECT}}.mimiciv_derived.sepsis3` AS sepsis
+    LEFT JOIN `{{SOURCE_PROJECT}}.mimiciv_3_1_derived.sepsis3` AS sepsis
         USING (subject_id, stay_id)
     WHERE (
         NOT @first_icu_stay_only

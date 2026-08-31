@@ -87,7 +87,7 @@ class CohortBoundaryTests(unittest.TestCase):
 
     def test_sql_project_replacement_and_validation(self) -> None:
         sql = render_stage1_sql(Path("sql/cohort_mimiciv.sql"))
-        self.assertIn("`physionet-data.mimiciv_icu.icustays`", sql)
+        self.assertIn("`physionet-data.mimiciv_3_1_icu.icustays`", sql)
         self.assertNotIn("{{SOURCE_PROJECT}}", sql)
         with self.assertRaises(ValueError):
             render_stage1_sql(Path("sql/cohort_mimiciv.sql"), "bad`project")

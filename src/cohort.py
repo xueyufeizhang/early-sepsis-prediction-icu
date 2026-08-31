@@ -1,7 +1,7 @@
 """Stage 1: build and audit the MIMIC-IV early-sepsis cohort.
 
 The validated Sepsis-3 definition is read from the materialized
-``physionet-data.mimiciv_derived.sepsis3`` concept. This module only applies the
+``physionet-data.mimiciv_3_1_derived.sepsis3`` concept. This module only applies the
 project-specific adult/first-stay/window rules; it does not recreate SOFA or
 suspected-infection logic.
 

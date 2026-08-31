@@ -21,17 +21,7 @@
 data/
 
 # --- Outputs derived from protected clinical data (never commit) ---
-# Keep only the empty directory placeholders under version control.
-/results/*
-!/results/figures/
-!/results/models/
-!/results/tables/
-/results/figures/*
-!/results/figures/.gitkeep
-/results/models/*
-!/results/models/.gitkeep
-/results/tables/*
-!/results/tables/.gitkeep
+/results/
 
 # --- Credentials / secrets ---
 .env

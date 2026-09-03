@@ -74,6 +74,8 @@ FEATURE_CATEGORIES = (
     "vasoactive_meds",       # vasopressor / inotrope support flags & doses
 )
 
+SOURCE_PROJECT = "physionet-data"
+
 # --------------------------------------------------------------------------
 # Models — brief Section 6. Classic ML on STATIC, LSTM on HOURLY.
 # --------------------------------------------------------------------------

@@ -28,6 +28,7 @@ from .config import (
     N_HOURS,
     RESULTS_FIGURES,
     RESULTS_TABLES,
+    SOURCE_PROJECT,
     SQL_DIR,
 )
 
@@ -35,7 +36,6 @@ if TYPE_CHECKING:
     from google.cloud import bigquery
 
 
-SOURCE_PROJECT = "physionet-data"
 COHORT_SQL_FILE = SQL_DIR / "cohort_mimiciv.sql"
 CONSORT_SQL_FILE = SQL_DIR / "consort_mimiciv.sql"
 

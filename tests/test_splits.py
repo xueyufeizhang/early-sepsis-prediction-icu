@@ -123,11 +123,13 @@ class PreprocessingTests(unittest.TestCase):
         pipeline = build_static_training_pipeline(
             static,
             LogisticRegression(max_iter=200),
+            smote_sampling_strategy=0.75,
             smote_k_neighbors=2,
         )
         pipeline.fit(static, static["label"])
         probabilities = pipeline.predict_proba(static)[:, 1]
         self.assertEqual(probabilities.shape, (len(static),))
+        self.assertEqual(pipeline.named_steps["smote"].sampling_strategy, 0.75)
 
         features = np.arange(60, dtype=float).reshape(30, 2)
         resampled_x, resampled_y = smote_resample(

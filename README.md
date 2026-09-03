@@ -92,8 +92,13 @@ representations have been generated in the controlled environment: a static
 patient matrix for tabular models and a six-hour value/mask tensor for the LSTM.
 No patient-level artifact is stored in this repository.
 
-Stage 3 code provides the frozen patient-grouped internal holdout, five
-`StratifiedGroupKFold` development folds, train-only static preprocessing with
-fold-local SMOTE, and train-only hourly imputation/scaling with an LSTM positive
-class weight. Run `notebooks/03_splits.ipynb` beside the protected Stage-2 files
-to create the assignments and review aggregate class-balance diagnostics.
+Stage 3 has passed its controlled run: 28,820 patients were divided into a
+23,056-row development set and a sealed 5,764-row internal test set, with five
+frozen patient-grouped development folds. Stage 4 now provides a reusable
+static-model cross-fitting framework and the Logistic Regression baseline in
+`src/models/classic.py`. Run `notebooks/04_models.ipynb` beside the protected
+Stage-2/3 artifacts: first complete the three-candidate smoke run, then explicitly
+enable the six-candidate LR imbalance screening across baseline, fold-derived
+class weighting, and four SMOTENC ratios. XGBoost screening and the remaining
+models are intentionally left for later Stage-4 milestones. Internal-test
+prediction and final threshold selection remain deferred to Stage 5.

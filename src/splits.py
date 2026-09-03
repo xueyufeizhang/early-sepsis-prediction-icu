@@ -21,11 +21,11 @@ from typing import Iterator, Sequence
 
 import numpy as np
 import pandas as pd
-from imblearn.over_sampling import SMOTE
+from imblearn.over_sampling import SMOTE, SMOTENC
 from imblearn.pipeline import Pipeline as ImbalancedPipeline
 from sklearn.base import BaseEstimator
 from sklearn.compose import ColumnTransformer
-from sklearn.impute import SimpleImputer
+from sklearn.impute import MissingIndicator, SimpleImputer
 from sklearn.model_selection import GroupShuffleSplit, StratifiedGroupKFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
@@ -136,6 +136,18 @@ class Stage3Artifacts:
     n_dev: int
     n_test: int
     n_folds: int
+
+
+@dataclass(frozen=True)
+class MixedFeatureSchema:
+    """Fold-derived column roles before and after mixed-type resampling."""
+
+    raw_columns: tuple[str, ...]
+    numeric_columns: tuple[str, ...]
+    categorical_columns: tuple[str, ...]
+    missing_indicator_columns: tuple[str, ...]
+    transformed_numeric_columns: tuple[str, ...]
+    transformed_categorical_columns: tuple[str, ...]
 
 
 def _require_columns(frame: pd.DataFrame, required: Sequence[str], name: str) -> None:
@@ -499,6 +511,7 @@ def build_static_training_pipeline(
     estimator: BaseEstimator,
     *,
     use_smote: bool = True,
+    smote_sampling_strategy: float | str = "auto",
     smote_k_neighbors: int = 5,
     scale_numeric: bool = True,
     random_state: int = RANDOM_SEED,
@@ -511,7 +524,175 @@ def build_static_training_pipeline(
         ("preprocessor", build_static_preprocessor(training_frame, scale_numeric=scale_numeric))
     ]
     if use_smote:
-        steps.append(("smote", SMOTE(k_neighbors=smote_k_neighbors, random_state=random_state)))
+        steps.append(
+            (
+                "smote",
+                SMOTE(
+                    sampling_strategy=smote_sampling_strategy,
+                    k_neighbors=smote_k_neighbors,
+                    random_state=random_state,
+                ),
+            )
+        )
+    steps.append(("estimator", estimator))
+    return ImbalancedPipeline(steps)
+
+
+def infer_mixed_feature_schema(training_frame: pd.DataFrame) -> MixedFeatureSchema:
+    """Infer fold-local roles for a SMOTENC-safe static pipeline."""
+
+    raw_columns = get_static_feature_columns(training_frame)
+    features = training_frame.loc[:, raw_columns]
+    categorical = tuple(
+        column for column in raw_columns if not pd.api.types.is_numeric_dtype(features[column])
+    )
+    numeric = tuple(column for column in raw_columns if column not in categorical)
+    indicators = tuple(column for column in numeric if features[column].isna().any())
+    transformed_numeric = tuple(f"numeric__{column}" for column in numeric)
+    transformed_categorical = (
+        *(f"missing__missingindicator_{column}" for column in indicators),
+        *(f"categorical__{column}" for column in categorical),
+    )
+    return MixedFeatureSchema(
+        raw_columns=raw_columns,
+        numeric_columns=numeric,
+        categorical_columns=categorical,
+        missing_indicator_columns=indicators,
+        transformed_numeric_columns=transformed_numeric,
+        transformed_categorical_columns=transformed_categorical,
+    )
+
+
+def build_pre_sampling_preprocessor(
+    training_frame: pd.DataFrame,
+) -> tuple[ColumnTransformer, MixedFeatureSchema]:
+    """Impute mixed raw features while retaining categorical semantics."""
+
+    schema = infer_mixed_feature_schema(training_frame)
+    transformers: list[tuple[str, object, list[str]]] = []
+    if schema.numeric_columns:
+        transformers.append(
+            (
+                "numeric",
+                SimpleImputer(strategy="median", keep_empty_features=True),
+                list(schema.numeric_columns),
+            )
+        )
+    if schema.missing_indicator_columns:
+        transformers.append(
+            (
+                "missing",
+                MissingIndicator(features="all"),
+                list(schema.missing_indicator_columns),
+            )
+        )
+    if schema.categorical_columns:
+        transformers.append(
+            (
+                "categorical",
+                SimpleImputer(strategy="most_frequent", keep_empty_features=True),
+                list(schema.categorical_columns),
+            )
+        )
+    if not transformers:
+        raise ValueError("Static matrix contains no usable model features")
+    preprocessor = ColumnTransformer(
+        transformers,
+        remainder="drop",
+        sparse_threshold=0,
+        verbose_feature_names_out=True,
+    ).set_output(transform="pandas")
+    return preprocessor, schema
+
+
+def build_post_sampling_preprocessor(
+    schema: MixedFeatureSchema,
+    *,
+    scale_numeric: bool = True,
+) -> ColumnTransformer:
+    """Scale continuous columns and one-hot encode sampler-safe categories."""
+
+    transformers: list[tuple[str, object, list[str]]] = []
+    if schema.transformed_numeric_columns:
+        numeric_transformer: object = StandardScaler() if scale_numeric else "passthrough"
+        transformers.append(
+            ("numeric", numeric_transformer, list(schema.transformed_numeric_columns))
+        )
+    if schema.transformed_categorical_columns:
+        transformers.append(
+            (
+                "categorical",
+                OneHotEncoder(handle_unknown="ignore", sparse_output=False),
+                list(schema.transformed_categorical_columns),
+            )
+        )
+    return ColumnTransformer(
+        transformers,
+        remainder="drop",
+        sparse_threshold=0,
+        verbose_feature_names_out=True,
+    )
+
+
+def build_static_resampling_pipeline(
+    training_frame: pd.DataFrame,
+    estimator: BaseEstimator,
+    *,
+    imbalance_strategy: str = "none",
+    sampling_strategy: float | str = "auto",
+    k_neighbors: int = 5,
+    scale_numeric: bool = True,
+    random_state: int = RANDOM_SEED,
+) -> ImbalancedPipeline:
+    """Build a fold-local baseline, cost-sensitive, SMOTENC, or SMOTE pipeline.
+
+    ``smotenc`` preserves nominal variables before one-hot encoding. ``smote``
+    remains available only for the later sensitivity analysis and therefore
+    operates after one-hot encoding. Cost-sensitive weighting is configured on
+    the estimator; its feature path is identical to ``none``.
+    """
+
+    allowed = {"none", "cost_sensitive", "smotenc", "smote"}
+    if imbalance_strategy not in allowed:
+        raise ValueError(f"Unknown imbalance strategy: {imbalance_strategy}")
+    if k_neighbors < 1:
+        raise ValueError("k_neighbors must be positive")
+
+    preprocessor, schema = build_pre_sampling_preprocessor(training_frame)
+    postprocessor = build_post_sampling_preprocessor(
+        schema,
+        scale_numeric=scale_numeric,
+    )
+    steps: list[tuple[str, object]] = [("pre_sampling", preprocessor)]
+    if imbalance_strategy == "smotenc":
+        if not schema.transformed_numeric_columns or not schema.transformed_categorical_columns:
+            raise ValueError("SMOTENC requires both continuous and categorical features")
+        steps.append(
+            (
+                "sampler",
+                SMOTENC(
+                    categorical_features=list(schema.transformed_categorical_columns),
+                    sampling_strategy=sampling_strategy,
+                    k_neighbors=k_neighbors,
+                    random_state=random_state,
+                ),
+            )
+        )
+        steps.append(("post_sampling", postprocessor))
+    elif imbalance_strategy == "smote":
+        steps.append(("post_sampling", postprocessor))
+        steps.append(
+            (
+                "sampler",
+                SMOTE(
+                    sampling_strategy=sampling_strategy,
+                    k_neighbors=k_neighbors,
+                    random_state=random_state,
+                ),
+            )
+        )
+    else:
+        steps.append(("post_sampling", postprocessor))
     steps.append(("estimator", estimator))
     return ImbalancedPipeline(steps)
 

@@ -1,9 +1,5 @@
 -- Stage 1: final MIMIC-IV early-sepsis cohort (BigQuery Standard SQL).
---
--- The Sepsis-3 clinical concept is the validated, materialized MIT-LCP table.
--- This query adds only the project-specific adult, first-stay, and N/M windows.
 -- Parameters: @n_hours, @m_hours, @age_min, @first_icu_stay_only.
--- {{SOURCE_PROJECT}} is replaced by src.cohort.render_stage1_sql after validation.
 
 WITH ranked_icu AS (
     SELECT

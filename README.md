@@ -87,14 +87,13 @@ access with your own credentialed account (do not commit credentials).
 
 ## Pipeline status
 
-**Stage 0 is complete; Stage 1 is ready to run.** The seven task decisions are locked
-in `src/config.py` (including N=6h and M=24h), and the validated MIT-LCP
-`sepsis3.sql` plus its `suspicion_of_infection.sql` dependency are present in
-`sql/` and have been reviewed. The parameterized MIMIC-IV cohort/CONSORT SQL,
-Python orchestration, leakage checks, synthetic boundary tests, and a clean
-execution notebook are implemented.
+Stages 0–2 are complete. The leakage-safe MIMIC-IV cohort and both Stage-2
+representations have been generated in the controlled environment: a static
+patient matrix for tabular models and a six-hour value/mask tensor for the LSTM.
+No patient-level artifact is stored in this repository.
 
-The remaining Stage-1 step is to run `notebooks/01_cohort.ipynb` in the user's
-credentialed BigQuery environment and review the protected audit sample plus the
-aggregate CONSORT counts. No real cohort extract, feature matrix, trained model,
-evaluation result, or completed presentation exists yet.
+Stage 3 code provides the frozen patient-grouped internal holdout, five
+`StratifiedGroupKFold` development folds, train-only static preprocessing with
+fold-local SMOTE, and train-only hourly imputation/scaling with an LSTM positive
+class weight. Run `notebooks/03_splits.ipynb` beside the protected Stage-2 files
+to create the assignments and review aggregate class-balance diagnostics.

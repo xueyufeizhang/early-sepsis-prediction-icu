@@ -99,6 +99,21 @@ static-model cross-fitting framework and the Logistic Regression baseline in
 `src/models/classic.py`. Run `notebooks/04_models.ipynb` beside the protected
 Stage-2/3 artifacts: first complete the three-candidate smoke run, then explicitly
 enable the six-candidate LR imbalance screening across baseline, fold-derived
-class weighting, and four SMOTENC ratios. XGBoost screening and the remaining
-models are intentionally left for later Stage-4 milestones. Internal-test
+class weighting, and four SMOTENC ratios. XGBoost also implements this screening;
+the remaining models are left for later Stage-4 milestones. Internal-test
 prediction and final threshold selection remain deferred to Stage 5.
+
+SMOTENC now runs **after numeric imputation/scaling fitted only on original
+training-fold rows**, and before categorical one-hot encoding. No scaler is
+refitted on the augmented sample. This distance-scaling step is mandatory even
+for XGBoost or when optional model scaling is disabled. Baseline and
+class-weighted feature values remain equivalent to their previous pipeline.
+
+After this correction, restart the notebook kernel and rerun Stage 4 using the
+existing Stage-2/3 artifacts; do not recreate patient splits. The notebook saves
+the corrected screening under `smotenc_scaled_v2` (with an additional `_smoke`
+suffix for smoke runs), preserving the previous artifacts. The optional
+`RUN_SMOTENC_QUALITY_AUDIT` cell reports aggregate synthetic-feature diagnostics
+on one training fold. Fractional counts and inconsistent missingness/count
+relationships are reported, not silently repaired; passing a scaling test does
+not establish clinical plausibility or guarantee better model performance.

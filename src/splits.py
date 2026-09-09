@@ -565,16 +565,27 @@ def infer_mixed_feature_schema(training_frame: pd.DataFrame) -> MixedFeatureSche
 
 def build_pre_sampling_preprocessor(
     training_frame: pd.DataFrame,
+    *,
+    scale_numeric: bool = False,
 ) -> tuple[ColumnTransformer, MixedFeatureSchema]:
-    """Impute mixed raw features while retaining categorical semantics."""
+    """Impute and optionally scale real training rows before resampling.
+
+    Keep missing indicators and nominal categories separate from the numeric
+    scaler. The returned preprocessor must be fitted on the training fold only.
+    """
 
     schema = infer_mixed_feature_schema(training_frame)
     transformers: list[tuple[str, object, list[str]]] = []
     if schema.numeric_columns:
+        numeric_transformer: object = SimpleImputer(strategy="median", keep_empty_features=True)
+        if scale_numeric:
+            numeric_transformer = Pipeline(
+                [("imputer", numeric_transformer), ("scaler", StandardScaler())]
+            )
         transformers.append(
             (
                 "numeric",
-                SimpleImputer(strategy="median", keep_empty_features=True),
+                numeric_transformer,
                 list(schema.numeric_columns),
             )
         )
@@ -650,6 +661,14 @@ def build_static_resampling_pipeline(
     remains available only for the later sensitivity analysis and therefore
     operates after one-hot encoding. Cost-sensitive weighting is configured on
     the estimator; its feature path is identical to ``none``.
+
+    Numeric scaling is always fitted BEFORE sampling, on imputed original
+    training rows. SMOTENC requires scaled distances even for tree estimators:
+    ``scale_numeric=False`` disables optional model scaling for other branches,
+    but does not disable SMOTENC's mandatory scaling. Its estimator consequently
+    receives standardized numeric features at both fit and prediction time.
+    Post-sampling preprocessing only encodes categories; it never refits a
+    scaler on the augmented distribution.
     """
 
     allowed = {"none", "cost_sensitive", "smotenc", "smote"}
@@ -658,10 +677,13 @@ def build_static_resampling_pipeline(
     if k_neighbors < 1:
         raise ValueError("k_neighbors must be positive")
 
-    preprocessor, schema = build_pre_sampling_preprocessor(training_frame)
+    preprocessor, schema = build_pre_sampling_preprocessor(
+        training_frame,
+        scale_numeric=scale_numeric or imbalance_strategy == "smotenc",
+    )
     postprocessor = build_post_sampling_preprocessor(
         schema,
-        scale_numeric=scale_numeric,
+        scale_numeric=False,
     )
     steps: list[tuple[str, object]] = [("pre_sampling", preprocessor)]
     if imbalance_strategy == "smotenc":

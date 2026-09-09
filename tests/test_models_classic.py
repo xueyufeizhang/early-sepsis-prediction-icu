@@ -9,11 +9,14 @@ import pandas as pd
 
 from src.models.classic import (
     StaticCandidate,
+    build_xgboost,
     build_logistic_regression,
     load_static_stage4_inputs,
     logistic_regression_candidates,
     save_static_training_result,
     train_static_model,
+    train_xgboost,
+    xgboost_candidates,
 )
 from src.splits import (
     build_patient_splits,
@@ -171,6 +174,104 @@ class StaticTrainingFrameworkTests(unittest.TestCase):
                 candidates=(invalid,),
                 estimator_factory=build_logistic_regression,
             )
+
+    def test_xgboost_candidate_profiles(self) -> None:
+        smoke = xgboost_candidates(profile="smoke")
+        screening = xgboost_candidates(profile="screening")
+
+        self.assertEqual(len(smoke), 3)
+        self.assertEqual(len(screening), 6)
+        self.assertEqual(
+            len({candidate.name for candidate in screening}),
+            len(screening),
+        )
+        self.assertEqual(
+            {candidate.strategy_name for candidate in screening},
+            {
+                "baseline",
+                "class_weight",
+                "smotenc_0.10",
+                "smotenc_0.25",
+                "smotenc_0.50",
+                "smotenc_1.00",
+            },
+        )
+
+        for candidate in screening:
+            if candidate.imbalance_strategy == "cost_sensitive":
+                self.assertEqual(candidate.positive_weight_multiplier, 1.0)
+                self.assertIsNone(candidate.sampling_strategy)
+            elif candidate.imbalance_strategy == "smotenc":
+                self.assertIsNone(candidate.positive_weight_multiplier)
+                self.assertIsNotNone(candidate.sampling_strategy)
+            else:
+                self.assertIsNone(candidate.positive_weight_multiplier)
+                self.assertIsNone(candidate.sampling_strategy)
+
+    def test_xgboost_factory_passes_parameters_and_weight(self) -> None:
+        candidates = xgboost_candidates(profile="smoke")
+
+        baseline = build_xgboost(
+            candidates[0].estimator_params,
+            positive_weight=None,
+        )
+        baseline_params = baseline.get_params()
+        self.assertEqual(baseline_params["n_estimators"], 300)
+        self.assertEqual(baseline_params["learning_rate"], 0.05)
+        self.assertEqual(baseline_params["max_depth"], 4)
+        self.assertEqual(baseline_params["scale_pos_weight"], 1.0)
+        self.assertNotIn("class_weight", baseline_params)
+
+        weighted = build_xgboost(
+            candidates[1].estimator_params,
+            positive_weight=24.0,
+        )
+        self.assertEqual(
+            weighted.get_params()["scale_pos_weight"],
+            24.0,
+        )
+
+    def test_xgboost_smoke_cross_fits_without_test_rows(self) -> None:
+        frame = _imbalanced_static_frame(n_rows=100)
+        frame["label"] = 0
+        frame.loc[::10, "label"] = 1
+        splits = build_patient_splits(frame)
+
+        result = train_xgboost(
+            frame,
+            splits,
+            profile="smoke",
+        )
+
+        n_dev = len(splits.dev_indices)
+        self.assertEqual(len(result.oof_predictions), n_dev)
+        self.assertEqual(
+            result.oof_predictions["row_index"].nunique(),
+            n_dev,
+        )
+        self.assertTrue(
+            set(result.oof_predictions["row_index"]).isdisjoint(
+                splits.test_indices
+            )
+        )
+        self.assertTrue(result.oof_predictions["probability"].between(0, 1).all())
+        self.assertEqual(len(result.strategy_metrics), 3)
+        self.assertEqual(
+            len(result.strategy_oof_predictions),
+            n_dev * 3,
+        )
+
+    def test_xgboost_weighting_and_sampling_are_mutually_exclusive(self) -> None:
+        for candidate in xgboost_candidates(profile="screening"):
+            if candidate.imbalance_strategy == "cost_sensitive":
+                self.assertIsNotNone(candidate.positive_weight_multiplier)
+                self.assertIsNone(candidate.sampling_strategy)
+            elif candidate.imbalance_strategy == "smotenc":
+                self.assertIsNone(candidate.positive_weight_multiplier)
+                self.assertIsNotNone(candidate.sampling_strategy)
+            else:
+                self.assertIsNone(candidate.positive_weight_multiplier)
+                self.assertIsNone(candidate.sampling_strategy)
 
     def test_artifacts_keep_patient_level_oof_in_protected_directory(self) -> None:
         result = train_static_model(

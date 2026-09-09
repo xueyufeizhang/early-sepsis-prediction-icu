@@ -22,7 +22,9 @@ import numpy as np
 import pandas as pd
 import sklearn
 from sklearn.base import BaseEstimator
+from sklearn.model_selection import ParameterGrid
 from sklearn.linear_model import LogisticRegression
+from xgboost import XGBClassifier
 from sklearn.metrics import (
     average_precision_score,
     brier_score_loss,
@@ -464,6 +466,106 @@ def train_static_model(
     )
 
 
+def xgboost_candidates(
+        *,
+        profile: str = "screening",
+) -> tuple[StaticCandidate, ...]:
+    if profile not in ["smoke", "screening"]:
+        raise ValueError("profile must be either 'smoke' or 'screening'")
+
+    xgb_grid = {
+        "n_estimators": (300,),
+        "learning_rate": (0.05,),
+        "max_depth": (4,),
+        "min_child_weight": (1,),
+        "subsample": (0.8,),
+        "colsample_bytree": (0.8,),
+    }
+
+    strategies: tuple[dict[str, Any], ...]
+    if profile == "smoke":
+        strategies = (
+            {"strategy_name": "baseline", "imbalance_strategy": "none"},
+            {
+                "strategy_name": "class_weight",
+                "imbalance_strategy": "cost_sensitive",
+                "positive_weight_multiplier": 1.0,
+            },
+            {
+                "strategy_name": "smotenc_0.25",
+                "imbalance_strategy": "smotenc",
+                "sampling_strategy": 0.25,
+            },
+        )
+    else:
+        strategies = (
+            {"strategy_name": "baseline", "imbalance_strategy": "none"},
+            {
+                "strategy_name": "class_weight",
+                "imbalance_strategy": "cost_sensitive",
+                "positive_weight_multiplier": 1.0,
+            },
+            *(
+                {
+                    "strategy_name": f"smotenc_{ratio:.2f}",
+                    "imbalance_strategy": "smotenc",
+                    "sampling_strategy": ratio,
+                } for ratio in (0.10, 0.25, 0.50, 1.00)
+            )
+        )
+
+    candidates = []
+    for idx, model_params in enumerate(ParameterGrid(xgb_grid)):
+        for strategy in strategies:
+            candidates.append(
+                StaticCandidate(
+                    name=f"xgb_cfg{idx+1}_{strategy['strategy_name']}",
+                    strategy_name=str(strategy["strategy_name"]),
+                    estimator_params=model_params,
+                    imbalance_strategy=str(strategy["imbalance_strategy"]),
+                    sampling_strategy=strategy.get("sampling_strategy"),
+                    positive_weight_multiplier=strategy.get("positive_weight_multiplier"),
+                )
+            )
+    return tuple(candidates)
+
+
+def build_xgboost(
+    params: Mapping[str, Any],
+    positive_weight: float | None,
+) -> XGBClassifier:
+    estimator_params = dict(params)
+    if positive_weight is None:
+        estimator_params["scale_pos_weight"] = 1.0
+    else:
+        estimator_params["scale_pos_weight"] = positive_weight
+    return XGBClassifier(
+        **estimator_params,
+        objective="binary:logistic",
+        eval_metric="logloss",
+        tree_method="hist",
+        device="cpu",
+        n_jobs=-1,
+        random_state=RANDOM_SEED,
+    )
+
+def train_xgboost(
+    frame: pd.DataFrame,
+    splits: PatientSplits,
+    *,
+    profile: str = "screening",
+    progress_callback: ProgressCallback | None = None,
+) -> StaticTrainingResult:
+    return train_static_model(
+        model_name="xgboost",
+        frame=frame,
+        splits=splits,
+        candidates=xgboost_candidates(profile=profile),
+        estimator_factory=build_xgboost,
+        progress_callback=progress_callback,
+    )
+
+
 def logistic_regression_candidates(
     *,
     profile: str = "screening",
@@ -642,6 +744,29 @@ def run_logistic_regression_stage4(
     )
     artifacts = save_static_training_result(
         result,
+        artifact_suffix="smoke" if profile == "smoke" else "",
+    )
+    return result, artifacts
+
+def run_xgboost_stage4(
+    *,
+    profile: str = "screening",
+    static_path: Path = STATIC_FEATURES_PATH,
+    assignments_path: Path = SPLIT_ASSIGNMENTS_PATH,
+    progress_callback: ProgressCallback | None = None,
+) -> tuple[StaticTrainingResult, StaticModelArtifacts]:
+    frame, splits = load_static_stage4_inputs(
+        static_path=static_path,
+        assignments_path=assignments_path,
+    )
+    result = train_xgboost(
+        frame=frame,
+        splits=splits,
+        profile=profile,
+        progress_callback=progress_callback,
+    )
+    artifacts = save_static_training_result(
+        result=result,
         artifact_suffix="smoke" if profile == "smoke" else "",
     )
     return result, artifacts

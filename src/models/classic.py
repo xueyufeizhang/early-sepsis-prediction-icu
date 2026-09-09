@@ -20,6 +20,7 @@ from typing import Any
 import joblib
 import numpy as np
 import pandas as pd
+from functools import partial
 import sklearn
 from sklearn.base import BaseEstimator
 from sklearn.model_selection import ParameterGrid
@@ -533,6 +534,7 @@ def xgboost_candidates(
 def build_xgboost(
     params: Mapping[str, Any],
     positive_weight: float | None,
+    device: str = "cpu",
 ) -> XGBClassifier:
     estimator_params = dict(params)
     if positive_weight is None:
@@ -544,7 +546,7 @@ def build_xgboost(
         objective="binary:logistic",
         eval_metric="logloss",
         tree_method="hist",
-        device="cpu",
+        device=device,
         n_jobs=-1,
         random_state=RANDOM_SEED,
     )
@@ -554,6 +556,7 @@ def train_xgboost(
     splits: PatientSplits,
     *,
     profile: str = "screening",
+    device: str = "cpu",
     progress_callback: ProgressCallback | None = None,
 ) -> StaticTrainingResult:
     return train_static_model(
@@ -561,7 +564,7 @@ def train_xgboost(
         frame=frame,
         splits=splits,
         candidates=xgboost_candidates(profile=profile),
-        estimator_factory=build_xgboost,
+        estimator_factory=partial(build_xgboost, device=device),
         progress_callback=progress_callback,
     )
 

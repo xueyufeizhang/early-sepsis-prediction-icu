@@ -23,7 +23,7 @@ import pandas as pd
 from functools import partial
 import sklearn
 from sklearn.base import BaseEstimator
-from sklearn.model_selection import ParameterGrid
+from sklearn.model_selection import ParameterGrid, ParameterSampler
 from sklearn.linear_model import LogisticRegression
 from xgboost import XGBClassifier
 from sklearn.metrics import (
@@ -471,17 +471,8 @@ def xgboost_candidates(
         *,
         profile: str = "screening",
 ) -> tuple[StaticCandidate, ...]:
-    if profile not in ["smoke", "screening"]:
-        raise ValueError("profile must be either 'smoke' or 'screening'")
-
-    xgb_grid = {
-        "n_estimators": (300,),
-        "learning_rate": (0.05,),
-        "max_depth": (4,),
-        "min_child_weight": (1,),
-        "subsample": (0.8,),
-        "colsample_bytree": (0.8,),
-    }
+    if profile not in ["smoke", "screening", "tuning"]:
+        raise ValueError("profile must be either 'smoke', 'screening' or 'tuning'")
 
     strategies: tuple[dict[str, Any], ...]
     if profile == "smoke":
@@ -498,6 +489,39 @@ def xgboost_candidates(
                 "sampling_strategy": 0.25,
             },
         )
+        xgb_grid = ParameterGrid({
+            "n_estimators": (300,),
+            "learning_rate": (0.05,),
+            "max_depth": (4,),
+            "min_child_weight": (1,),
+            "subsample": (0.8,),
+            "colsample_bytree": (0.8,),
+        })
+    elif profile == "screening":
+        strategies = (
+            {"strategy_name": "baseline", "imbalance_strategy": "none"},
+            {
+                "strategy_name": "class_weight",
+                "imbalance_strategy": "cost_sensitive",
+                "positive_weight_multiplier": 1.0,
+            },
+            *(
+                {
+                    "strategy_name": f"smotenc_{ratio:.2f}",
+                    "imbalance_strategy": "smotenc",
+                    "sampling_strategy": ratio,
+                }
+                for ratio in (0.10, 0.25, 0.50, 1.00)
+            ),
+        )
+        xgb_grid = ParameterGrid({
+            "n_estimators": (300,),
+            "learning_rate": (0.05,),
+            "max_depth": (4,),
+            "min_child_weight": (1,),
+            "subsample": (0.8,),
+            "colsample_bytree": (0.8,),
+        })
     else:
         strategies = (
             {"strategy_name": "baseline", "imbalance_strategy": "none"},
@@ -511,12 +535,21 @@ def xgboost_candidates(
                     "strategy_name": f"smotenc_{ratio:.2f}",
                     "imbalance_strategy": "smotenc",
                     "sampling_strategy": ratio,
-                } for ratio in (0.10, 0.25, 0.50, 1.00)
+                } for ratio in (0.10,)
             )
         )
+        np.random.seed(RANDOM_SEED)
+        xgb_grid = ParameterSampler({
+            "n_estimators": (200, 300, 400, 600),
+            "learning_rate": (0.03, 0.05, 0.10),
+            "max_depth": (3, 4, 6),
+            "min_child_weight": (1, 5),
+            "subsample": (0.8, 1.0),
+            "colsample_bytree": (0.8, 1.0),
+        }, n_iter=10, random_state=RANDOM_SEED)
 
     candidates = []
-    for idx, model_params in enumerate(ParameterGrid(xgb_grid)):
+    for idx, model_params in enumerate(xgb_grid):
         for strategy in strategies:
             candidates.append(
                 StaticCandidate(
@@ -579,13 +612,11 @@ def logistic_regression_candidates(
     ordinary post-one-hot SMOTE are deliberately left for the next milestone.
     """
 
-    if profile not in {"smoke", "screening"}:
-        raise ValueError("profile must be either 'smoke' or 'screening'")
+    if profile not in {"smoke", "screening", "tuning"}:
+        raise ValueError("profile must be either 'smoke', 'screening' or 'tuning'")
     # Keep model capacity fixed during strategy screening so the first pass
     # isolates imbalance handling. Full LR tuning follows after the strategy
     # shortlist and is intentionally not implemented in this milestone.
-    c_values = (1.0,)
-    penalties = ("l2",)
     strategies: tuple[dict[str, Any], ...]
     if profile == "smoke":
         strategies = (
@@ -601,7 +632,11 @@ def logistic_regression_candidates(
                 "sampling_strategy": 0.25,
             },
         )
-    else:
+        lr_grid = {
+                "c_value": (1.0,),
+                "penalty": ("l2",),
+            }
+    elif profile == "screening":
         strategies = (
             {"strategy_name": "baseline", "imbalance_strategy": "none"},
             {
@@ -618,23 +653,49 @@ def logistic_regression_candidates(
                 for ratio in (0.10, 0.25, 0.50, 1.00)
             ),
         )
+        candidates = []
+        lr_grid = {
+            "c_value": (1.0,),
+            "penalty": ("l2",),
+        }
+    else:
+        strategies = (
+            {"strategy_name": "baseline", "imbalance_strategy": "none"},
+            {
+                "strategy_name": "class_weight",
+                "imbalance_strategy": "cost_sensitive",
+                "positive_weight_multiplier": 1.0,
+            },
+            *(
+                {
+                    "strategy_name": f"smotenc_{ratio:.2f}",
+                    "imbalance_strategy": "smotenc",
+                    "sampling_strategy": ratio,
+                }
+                for ratio in (0.10,)
+            ),
+        )
+        candidates = []
+        lr_grid = {
+            "c_value": (0.01, 0.1, 1.0, 10.0, 100.0),
+            "penalty": ("l1", "l2"),
+        }
 
     candidates = []
-    for penalty in penalties:
-        for c_value in c_values:
-            for strategy in strategies:
-                candidates.append(
-                    StaticCandidate(
-                        name=f"lr_{penalty}_c{c_value:g}_{strategy['strategy_name']}",
-                        strategy_name=str(strategy["strategy_name"]),
-                        estimator_params={"C": c_value, "penalty": penalty},
-                        imbalance_strategy=str(strategy["imbalance_strategy"]),
-                        sampling_strategy=strategy.get("sampling_strategy"),
-                        positive_weight_multiplier=strategy.get(
-                            "positive_weight_multiplier"
-                        ),
-                    )
+    for model_params in ParameterGrid(lr_grid):
+        for strategy in strategies:
+            candidates.append(
+                StaticCandidate(
+                    name=f"lr_{model_params.get("penalty")}_c{model_params.get("c_value"):g}_{strategy['strategy_name']}",
+                    strategy_name=str(strategy["strategy_name"]),
+                    estimator_params={"C": model_params.get("c_value"), "penalty": model_params.get("penalty")},
+                    imbalance_strategy=str(strategy["imbalance_strategy"]),
+                    sampling_strategy=strategy.get("sampling_strategy"),
+                    positive_weight_multiplier=strategy.get(
+                        "positive_weight_multiplier"
+                    ),
                 )
+            )
     return tuple(candidates)
 
 

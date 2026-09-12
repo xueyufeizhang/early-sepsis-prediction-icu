@@ -12,8 +12,12 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from hashlib import sha256
+from importlib.metadata import version
+import inspect
 import json
 from pathlib import Path
+import platform
 from time import perf_counter
 from typing import Any
 
@@ -25,6 +29,7 @@ import sklearn
 from sklearn.base import BaseEstimator
 from sklearn.model_selection import ParameterGrid, ParameterSampler
 from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
 from xgboost import XGBClassifier
 from sklearn.metrics import (
     average_precision_score,
@@ -42,8 +47,10 @@ from ..splits import (
     build_static_resampling_pipeline,
     validate_patient_splits,
 )
+from .checkpoints import TrainingCheckpoint
 
 OOF_DIR = DATA_PROCESSED / "oof_predictions"
+CHECKPOINT_DIR = DATA_PROCESSED / "checkpoints"
 IMBALANCE_STRATEGIES = frozenset({"none", "cost_sensitive", "smotenc", "smote"})
 
 
@@ -79,6 +86,113 @@ class StaticCandidate:
 
 EstimatorFactory = Callable[[Mapping[str, Any], float | None], BaseEstimator]
 ProgressCallback = Callable[[str], None]
+
+
+def _checkpoint_json_value(value: Any) -> Any:
+    """Canonical, JSON-safe estimator settings (including XGB's NaN default)."""
+
+    if isinstance(value, np.generic):
+        return _checkpoint_json_value(value.item())
+    if isinstance(value, float) and not np.isfinite(value):
+        return {"nonfinite_float": str(value)}
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return value
+    if isinstance(value, Mapping):
+        return {str(key): _checkpoint_json_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, np.ndarray)):
+        return [_checkpoint_json_value(item) for item in value]
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, BaseEstimator):
+        return {
+            "class": f"{type(value).__module__}.{type(value).__qualname__}",
+            "params": _checkpoint_json_value(value.get_params(deep=True)),
+        }
+    if callable(value):
+        return _factory_identity(value)
+    raise TypeError(
+        f"Unsupported checkpoint parameter type: {type(value).__name__}. "
+        "Use serializable estimator settings or disable checkpointing."
+    )
+
+
+def _factory_identity(factory: EstimatorFactory) -> dict[str, Any]:
+    """Identify factory implementation and bound options without training it."""
+
+    if isinstance(factory, partial):
+        return {
+            "function": _factory_identity(factory.func),
+            "args": _checkpoint_json_value(factory.args),
+            "kwargs": _checkpoint_json_value(factory.keywords),
+        }
+    target = factory if inspect.isfunction(factory) or inspect.isclass(factory) else type(factory)
+    try:
+        source = inspect.getsource(target)
+    except (OSError, TypeError):
+        # Built-in/library callables can lack inspectable Python source. Their
+        # effective parameters and dependency versions are also fingerprinted.
+        source = None
+    return {
+        "name": f"{target.__module__}.{target.__qualname__}",
+        "source_sha256": None if source is None else sha256(source.encode()).hexdigest(),
+    }
+
+
+def _frame_fingerprint(frame: pd.DataFrame) -> dict[str, Any]:
+    """Hash row order, values, index and schema; never put patient values in JSON."""
+
+    hashes = pd.util.hash_pandas_object(frame, index=True, categorize=True)
+    return {
+        "shape": list(frame.shape),
+        "columns": [str(column) for column in frame.columns],
+        "dtypes": [repr(dtype) for dtype in frame.dtypes],
+        "values_sha256": sha256(hashes.to_numpy(dtype="uint64").tobytes()).hexdigest(),
+    }
+
+
+def _checkpoint_manifest(
+    model_name: str,
+    frame: pd.DataFrame,
+    splits: PatientSplits,
+    candidates: Sequence[StaticCandidate],
+    estimator_factory: EstimatorFactory,
+    random_state: int,
+) -> dict[str, Any]:
+    """Refuse stale folds after data, configuration, code or environment changes."""
+
+    descriptions = []
+    for candidate in candidates:
+        estimator = estimator_factory(candidate.estimator_params, None)
+        descriptions.append({
+            "candidate": candidate.as_dict(),
+            "estimator_class": f"{type(estimator).__module__}.{type(estimator).__qualname__}",
+            "effective_estimator_params": estimator.get_params(deep=True),
+        })
+    source_root = Path(__file__).resolve().parents[1]
+    source_files = (
+        "models/classic.py", "models/checkpoints.py", "splits.py", "features.py", "config.py"
+    )
+    return _checkpoint_json_value({
+        "model_name": model_name,
+        "random_state": random_state,
+        "n_rows": len(frame),
+        # Holdout features are not involved in checkpoint identity or fitting.
+        "development_data": _frame_fingerprint(frame.iloc[splits.dev_indices]),
+        "split_assignments": _frame_fingerprint(splits.assignments),
+        "candidates": descriptions,
+        "estimator_factory": _factory_identity(estimator_factory),
+        "versions": {
+            "python": platform.python_version(),
+            **{package: version(package) for package in (
+                "numpy", "pandas", "scipy", "scikit-learn", "imbalanced-learn",
+                "xgboost", "joblib",
+            )},
+        },
+        "source_sha256": {
+            name: sha256((source_root / name).read_bytes()).hexdigest()
+            for name in source_files
+        },
+    })
 
 
 @dataclass
@@ -199,6 +313,8 @@ def _fit_candidate_oof(
     estimator_factory: EstimatorFactory,
     *,
     random_state: int,
+    checkpoint: TrainingCheckpoint | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> tuple[np.ndarray, list[dict[str, float | int | str]]]:
     """Cross-fit one candidate and return development-only OOF probabilities."""
 
@@ -207,6 +323,18 @@ def _fit_candidate_oof(
     labels = frame["label"].to_numpy(dtype=np.int8)
 
     for fold, (train_indices, validation_indices) in enumerate(splits.iter_cv()):
+        cached = None if checkpoint is None else checkpoint.load_fold(
+            candidate.name, fold, validation_indices
+        )
+        if cached is not None:
+            probabilities, metrics = cached
+            if metrics["strategy"] != candidate.strategy_name or metrics["n_train"] != len(train_indices):
+                raise ValueError("Checkpoint fold metadata does not match this training run")
+            oof[validation_indices] = probabilities
+            rows.append(metrics)
+            if progress_callback is not None:
+                progress_callback(f"  [resume] {candidate.name}, fold {fold}: loaded")
+            continue
         training = frame.iloc[train_indices]
         validation = frame.iloc[validation_indices]
         train_labels = labels[train_indices]
@@ -246,6 +374,10 @@ def _fit_candidate_oof(
                 "fit_seconds": fit_seconds,
             }
         )
+        if checkpoint is not None:
+            checkpoint.save_fold(candidate.name, fold, validation_indices, probabilities, rows[-1])
+            if progress_callback is not None:
+                progress_callback(f"  [checkpoint] {candidate.name}, fold {fold}: saved")
 
     dev_indices = splits.dev_indices
     test_indices = splits.test_indices
@@ -382,6 +514,8 @@ def train_static_model(
     estimator_factory: EstimatorFactory,
     random_state: int = RANDOM_SEED,
     progress_callback: ProgressCallback | None = None,
+    checkpoint_dir: Path | None = None,
+    resume: bool = True,
 ) -> StaticTrainingResult:
     """Screen imbalance strategies, select a candidate, and refit on dev.
 
@@ -389,10 +523,43 @@ def train_static_model(
     AUPRC is the tie-breaker, and lower AUROC variability is the next stable
     sort key. Calibration diagnostics are reported but do not silently change
     the primary selection rule.
+
+    Pass a private checkpoint directory to persist completed candidate/fold
+    predictions and the final dev model. Repeating the same call resumes them.
+    With ``None`` (the default), no checkpoint files are read or written.
+    ``resume=False`` requires a fresh directory; existing runs are never erased.
+    Only load checkpoints created by your own trusted training process.
     """
 
     validate_patient_splits(frame, splits)
     _validate_candidates(candidates)
+    arguments = dict(
+        model_name=model_name, frame=frame, splits=splits, candidates=candidates,
+        estimator_factory=estimator_factory, random_state=random_state,
+        progress_callback=progress_callback,
+    )
+    if checkpoint_dir is None:
+        return _train_static_model(**arguments, checkpoint=None)
+    manifest = _checkpoint_manifest(
+        model_name, frame, splits, candidates, estimator_factory, random_state
+    )
+    with TrainingCheckpoint(Path(checkpoint_dir), manifest, resume=resume) as checkpoint:
+        return _train_static_model(**arguments, checkpoint=checkpoint)
+
+
+def _train_static_model(
+    *,
+    model_name: str,
+    frame: pd.DataFrame,
+    splits: PatientSplits,
+    candidates: Sequence[StaticCandidate],
+    estimator_factory: EstimatorFactory,
+    random_state: int,
+    progress_callback: ProgressCallback | None,
+    checkpoint: TrainingCheckpoint | None,
+) -> StaticTrainingResult:
+    """Execute one validated search while the optional checkpoint lock is held."""
+
     fold_rows: list[dict[str, float | int | str]] = []
     oof_by_candidate: dict[str, np.ndarray] = {}
 
@@ -407,6 +574,8 @@ def train_static_model(
             candidate,
             estimator_factory,
             random_state=random_state,
+            checkpoint=checkpoint,
+            progress_callback=progress_callback,
         )
         oof_by_candidate[candidate.name] = oof
         fold_rows.extend(rows)
@@ -434,25 +603,35 @@ def train_static_model(
         splits=splits,
     )
 
-    development = frame.iloc[splits.dev_indices]
-    development_labels = development["label"].to_numpy(dtype=np.int8)
-    positive_weight = _fold_positive_weight(development_labels, best_candidate)
-    final_pipeline = build_static_resampling_pipeline(
-        development,
-        estimator_factory(best_candidate.estimator_params, positive_weight),
-        imbalance_strategy=best_candidate.imbalance_strategy,
-        sampling_strategy=(
-            best_candidate.sampling_strategy
-            if best_candidate.sampling_strategy is not None
-            else "auto"
-        ),
-        k_neighbors=best_candidate.k_neighbors,
-        scale_numeric=best_candidate.scale_numeric,
-        random_state=random_state,
-    )
-    final_started_at = perf_counter()
-    final_pipeline.fit(development, development_labels)
-    final_fit_seconds = perf_counter() - final_started_at
+    cached_final = None if checkpoint is None else checkpoint.load_final(best_candidate.name)
+    if cached_final is not None:
+        final_pipeline, final_fit_seconds = cached_final
+        if progress_callback is not None:
+            progress_callback("[resume] Final development model: loaded")
+    else:
+        development = frame.iloc[splits.dev_indices]
+        development_labels = development["label"].to_numpy(dtype=np.int8)
+        positive_weight = _fold_positive_weight(development_labels, best_candidate)
+        final_pipeline = build_static_resampling_pipeline(
+            development,
+            estimator_factory(best_candidate.estimator_params, positive_weight),
+            imbalance_strategy=best_candidate.imbalance_strategy,
+            sampling_strategy=(
+                best_candidate.sampling_strategy
+                if best_candidate.sampling_strategy is not None
+                else "auto"
+            ),
+            k_neighbors=best_candidate.k_neighbors,
+            scale_numeric=best_candidate.scale_numeric,
+            random_state=random_state,
+        )
+        final_started_at = perf_counter()
+        final_pipeline.fit(development, development_labels)
+        final_fit_seconds = perf_counter() - final_started_at
+        if checkpoint is not None:
+            checkpoint.save_final(best_candidate.name, final_pipeline, final_fit_seconds)
+            if progress_callback is not None:
+                progress_callback("[checkpoint] Final development model: saved")
 
     return StaticTrainingResult(
         model_name=model_name,
@@ -538,7 +717,6 @@ def xgboost_candidates(
                 } for ratio in (0.10,)
             )
         )
-        np.random.seed(RANDOM_SEED)
         xgb_grid = ParameterSampler({
             "n_estimators": (200, 300, 400, 600),
             "learning_rate": (0.03, 0.05, 0.10),
@@ -591,6 +769,8 @@ def train_xgboost(
     profile: str = "screening",
     device: str = "cpu",
     progress_callback: ProgressCallback | None = None,
+    checkpoint_dir: Path | None = None,
+    resume: bool = True,
 ) -> StaticTrainingResult:
     return train_static_model(
         model_name="xgboost",
@@ -599,6 +779,8 @@ def train_xgboost(
         candidates=xgboost_candidates(profile=profile),
         estimator_factory=partial(build_xgboost, device=device),
         progress_callback=progress_callback,
+        checkpoint_dir=checkpoint_dir,
+        resume=resume,
     )
 
 
@@ -691,9 +873,7 @@ def logistic_regression_candidates(
                     estimator_params={"C": model_params.get("c_value"), "penalty": model_params.get("penalty")},
                     imbalance_strategy=str(strategy["imbalance_strategy"]),
                     sampling_strategy=strategy.get("sampling_strategy"),
-                    positive_weight_multiplier=strategy.get(
-                        "positive_weight_multiplier"
-                    ),
+                    positive_weight_multiplier=strategy.get("positive_weight_multiplier"),
                 )
             )
     return tuple(candidates)
@@ -728,6 +908,8 @@ def train_logistic_regression(
     *,
     profile: str = "screening",
     progress_callback: ProgressCallback | None = None,
+    checkpoint_dir: Path | None = None,
+    resume: bool = True,
 ) -> StaticTrainingResult:
     """Run the Stage-4 LR smoke test or six-strategy screening experiment."""
 
@@ -738,6 +920,116 @@ def train_logistic_regression(
         candidates=logistic_regression_candidates(profile=profile),
         estimator_factory=build_logistic_regression,
         progress_callback=progress_callback,
+        checkpoint_dir=checkpoint_dir,
+        resume=resume,
+    )
+
+
+def random_forest_candidates(
+    *,
+    profile: str = "tuning",
+) -> tuple[StaticCandidate, ...]:
+    if profile not in {"smoke", "tuning"}:
+        raise ValueError("profile must be either 'smoke' or 'tuning'")
+
+    strategies: tuple[dict[str, Any], ...]
+    if profile == "smoke":
+        strategies = [
+            {"strategy_name": "baseline", "imbalance_strategy": "none"},
+            {
+                "strategy_name": "class_weight",
+                "imbalance_strategy": "cost_sensitive",
+                "positive_weight_multiplier": 1.0,
+            },
+            {
+                "strategy_name": "smotenc_0.25",
+                "imbalance_strategy": "smotenc",
+                "sampling_strategy": 0.25,
+            },
+        ]
+        rf_grid = ParameterGrid({
+            "n_estimators": (300,),
+            "max_depth": (6,),
+            "min_samples_leaf": (1,),
+            "max_features": (0.3,),
+            "min_samples_split": (2,),
+        })
+    else:
+        strategies = [
+            {"strategy_name": "baseline", "imbalance_strategy": "none"},
+            {
+                "strategy_name": "class_weight",
+                "imbalance_strategy": "cost_sensitive",
+                "positive_weight_multiplier": 1.0,
+            },
+            *(
+                {
+                    "strategy_name": f"smotenc_{ratio:.2f}",
+                    "imbalance_strategy": "smotenc",
+                    "sampling_strategy": ratio,
+                } for ratio in (0.10,)
+            ),
+        ]
+        rf_grid = ParameterSampler({
+            "n_estimators": (300, 600),
+            "max_depth": (6, 12, 20, None),
+            "min_samples_leaf": (1, 5, 10, 20),
+            "max_features": ("sqrt", 0.3, 0.5),
+            "min_samples_split": (2, 10, 20),
+        }, n_iter=10, random_state=RANDOM_SEED)
+
+    candidates = []
+    for idx, model_params in enumerate(rf_grid):
+        for strategy in strategies:
+            candidates.append(
+                StaticCandidate(
+                    name=f"rf_cfg{idx+1}_{strategy['strategy_name']}",
+                    strategy_name=str(strategy["strategy_name"]),
+                    estimator_params=model_params,
+                    scale_numeric=False,
+                    imbalance_strategy=str(strategy["imbalance_strategy"]),
+                    sampling_strategy=strategy.get("sampling_strategy"),
+                    positive_weight_multiplier=strategy.get("positive_weight_multiplier"),
+                )
+            )
+    return tuple(candidates)
+
+
+def build_random_forest(
+        params: Mapping[str, Any],
+        positive_weight: float | None,
+) -> RandomForestClassifier:
+    estimator_params = dict(params)
+    if positive_weight is not None:
+            estimator_params["class_weight"] = {0: 1.0, 1: positive_weight}
+    return RandomForestClassifier(
+        **estimator_params,
+        criterion="gini",
+        bootstrap=True,
+        max_samples=None,
+        oob_score=False,
+        n_jobs=-1,
+        random_state=RANDOM_SEED,
+    )
+
+def train_random_forest(
+    frame: pd.DataFrame,
+    splits: PatientSplits,
+    *,
+    profile: str = "tuning",
+    progress_callback: ProgressCallback | None = None,
+    checkpoint_dir: Path | None = None,
+    resume: bool = True,
+) -> StaticTrainingResult:
+    return train_static_model(
+        model_name="random_forest",
+        frame=frame,
+        splits=splits,
+        candidates=random_forest_candidates(profile=profile),
+        estimator_factory=build_random_forest,
+        progress_callback=progress_callback,
+        checkpoint_dir=checkpoint_dir,
+        resume=resume,
     )
 
 
@@ -793,6 +1085,8 @@ def run_logistic_regression_stage4(
     static_path: Path = STATIC_FEATURES_PATH,
     assignments_path: Path = SPLIT_ASSIGNMENTS_PATH,
     progress_callback: ProgressCallback | None = None,
+    checkpoint_dir: Path | None = None,
+    resume: bool = True,
 ) -> tuple[StaticTrainingResult, StaticModelArtifacts]:
     """Load protected inputs, run LR screening, and persist its artifacts."""
 
@@ -805,6 +1099,8 @@ def run_logistic_regression_stage4(
         splits,
         profile=profile,
         progress_callback=progress_callback,
+        checkpoint_dir=checkpoint_dir,
+        resume=resume,
     )
     artifacts = save_static_training_result(
         result,
@@ -818,6 +1114,8 @@ def run_xgboost_stage4(
     static_path: Path = STATIC_FEATURES_PATH,
     assignments_path: Path = SPLIT_ASSIGNMENTS_PATH,
     progress_callback: ProgressCallback | None = None,
+    checkpoint_dir: Path | None = None,
+    resume: bool = True,
 ) -> tuple[StaticTrainingResult, StaticModelArtifacts]:
     frame, splits = load_static_stage4_inputs(
         static_path=static_path,
@@ -828,6 +1126,35 @@ def run_xgboost_stage4(
         splits=splits,
         profile=profile,
         progress_callback=progress_callback,
+        checkpoint_dir=checkpoint_dir,
+        resume=resume,
+    )
+    artifacts = save_static_training_result(
+        result=result,
+        artifact_suffix="smoke" if profile == "smoke" else "",
+    )
+    return result, artifacts
+
+def run_random_forest_stage4(
+    *,
+    profile: str = "tuning",
+    static_path: Path = STATIC_FEATURES_PATH,
+    assignments_path: Path = SPLIT_ASSIGNMENTS_PATH,
+    progress_callback: ProgressCallback | None = None,
+    checkpoint_dir: Path | None = None,
+    resume: bool = True,
+) -> tuple[StaticTrainingResult, StaticModelArtifacts]:
+    frame, splits = load_static_stage4_inputs(
+        static_path=static_path,
+        assignments_path=assignments_path,
+    )
+    result = train_random_forest(
+        frame=frame,
+        splits=splits,
+        profile=profile,
+        progress_callback=progress_callback,
+        checkpoint_dir=checkpoint_dir,
+        resume=resume,
     )
     artifacts = save_static_training_result(
         result=result,

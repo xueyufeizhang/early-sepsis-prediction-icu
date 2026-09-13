@@ -1,7 +1,10 @@
 # Stage 4 训练断点续跑
 
-LR、XGBoost 和 Random Forest 共用按“候选配置 × fold”保存的 checkpoint。
+LR、XGBoost、Random Forest 和 SVM 共用按“候选配置 × fold”保存的 checkpoint。
 它记录已经完成的工作；不改变冻结的五折划分、不接触内部测试集评估，也不忽略训练失败。
+
+SVM 的内部概率校准仍属于一个外层 fold，内部中断会重跑该未完成的外层 fold；
+具体运行入口与耗时说明见 [SVM 训练说明](svm_training.md)。
 
 ## 开启方式
 

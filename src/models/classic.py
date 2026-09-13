@@ -1,8 +1,7 @@
 """Stage 4 static-model training with frozen, leakage-safe folds.
 
-The implemented milestone covers the reusable imbalance-aware framework and
-the Logistic Regression screening experiment. XGBoost screening and the other
-models intentionally remain for the next Stage-4 milestones.
+LR, XGBoost and Random Forest use the shared imbalance-aware framework. SVM
+adds patient-grouped, fold-local sigmoid calibration to produce probabilities.
 
 Patient-level OOF predictions are protected PhysioNet derivatives and are
 saved only under the gitignored ``data/`` workspace.
@@ -22,14 +21,18 @@ from time import perf_counter
 from typing import Any
 
 import joblib
+from imblearn.utils import check_sampling_strategy
 import numpy as np
 import pandas as pd
 from functools import partial
 import sklearn
-from sklearn.base import BaseEstimator
-from sklearn.model_selection import ParameterGrid, ParameterSampler
+from sklearn.base import BaseEstimator, ClassifierMixin
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.model_selection import ParameterGrid, ParameterSampler, StratifiedGroupKFold
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.svm import SVC
+from sklearn.utils.validation import check_is_fitted
 from xgboost import XGBClassifier
 from sklearn.metrics import (
     average_precision_score,
@@ -66,6 +69,8 @@ class StaticCandidate:
     positive_weight_multiplier: float | None = None
     k_neighbors: int = 5
     scale_numeric: bool = True
+    calibration_method: str | None = None
+    calibration_n_splits: int = 3
 
     def as_dict(self) -> dict[str, Any]:
         """Return a serialisable description suitable for aggregate tables."""
@@ -78,6 +83,8 @@ class StaticCandidate:
             "positive_weight_multiplier": self.positive_weight_multiplier,
             "k_neighbors": self.k_neighbors if self.sampling_strategy is not None else None,
             "scale_numeric": self.scale_numeric,
+            "calibration_method": self.calibration_method,
+            "calibration_n_splits": self.calibration_n_splits,
             "estimator_params": json.dumps(
                 dict(self.estimator_params), sort_keys=True, separators=(",", ":")
             ),
@@ -245,6 +252,14 @@ def _validate_candidates(candidates: Sequence[StaticCandidate]) -> None:
         raise ValueError("Candidate names must be unique")
 
     for candidate in candidates:
+        if candidate.calibration_method not in {None, "sigmoid"}:
+            raise ValueError("calibration_method must be None or 'sigmoid'")
+        if (
+            isinstance(candidate.calibration_n_splits, (bool, np.bool_))
+            or not isinstance(candidate.calibration_n_splits, (int, np.integer))
+            or candidate.calibration_n_splits < 2
+        ):
+            raise ValueError("calibration_n_splits must be an integer of at least 2")
         strategy = candidate.imbalance_strategy
         if strategy not in IMBALANCE_STRATEGIES:
             raise ValueError(f"Unknown imbalance strategy: {strategy}")
@@ -279,6 +294,177 @@ def _fold_positive_weight(labels: np.ndarray, candidate: StaticCandidate) -> flo
         raise ValueError("Both classes are required for cost-sensitive learning")
     multiplier = float(candidate.positive_weight_multiplier)
     return multiplier * negatives / positives
+
+
+def _fit_plain_candidate(
+    training: pd.DataFrame,
+    labels: np.ndarray,
+    candidate: StaticCandidate,
+    estimator_factory: EstimatorFactory,
+    *,
+    random_state: int,
+) -> BaseEstimator:
+    """Build AND fit using only this training subset, including schema discovery."""
+
+    positive_weight = _fold_positive_weight(labels, candidate)
+    estimator = estimator_factory(candidate.estimator_params, positive_weight)
+    pipeline = build_static_resampling_pipeline(
+        training,
+        estimator,
+        imbalance_strategy=candidate.imbalance_strategy,
+        sampling_strategy=(
+            candidate.sampling_strategy if candidate.sampling_strategy is not None else "auto"
+        ),
+        k_neighbors=candidate.k_neighbors,
+        scale_numeric=candidate.scale_numeric,
+        random_state=random_state,
+    )
+    pipeline.fit(training, labels)
+    return pipeline
+
+
+class FoldLocalStaticClassifier(ClassifierMixin, BaseEstimator):
+    """Cloneable score estimator that rebuilds preprocessing on every fit.
+
+    CalibratedClassifierCV supplies raw inner-training rows to ``fit``. Building
+    the pipeline here keeps imputation, scaling, missingness schema discovery,
+    resampling and class weights local to those rows. Define this class at module
+    scope so the calibrated final model can be saved and loaded with joblib.
+    """
+
+    def __init__(
+        self,
+        candidate: StaticCandidate,
+        estimator_factory: EstimatorFactory,
+        random_state: int = RANDOM_SEED,
+    ):
+        self.candidate = candidate
+        self.estimator_factory = estimator_factory
+        self.random_state = random_state
+
+    def fit(self, X: pd.DataFrame, y: np.ndarray) -> FoldLocalStaticClassifier:
+        self.pipeline_ = _fit_plain_candidate(
+            X, np.asarray(y), self.candidate, self.estimator_factory,
+            random_state=self.random_state,
+        )
+        self.classes_ = self.pipeline_.classes_
+        if not np.array_equal(self.classes_, [0, 1]):
+            raise ValueError("Calibrated static classifiers require binary labels 0 and 1")
+        return self
+
+    def decision_function(self, X: pd.DataFrame) -> np.ndarray:
+        check_is_fitted(self, "pipeline_")
+        scores = np.asarray(self.pipeline_.decision_function(X), dtype=float)
+        if scores.shape != (len(X),) or not np.isfinite(scores).all():
+            raise ValueError("Binary decision scores must be finite and one-dimensional")
+        return scores
+
+    def predict(self, X: pd.DataFrame) -> np.ndarray:
+        check_is_fitted(self, "pipeline_")
+        return self.pipeline_.predict(X)
+
+
+def _validate_calibration_sampling(
+    labels: np.ndarray, candidate: StaticCandidate, *, context: str,
+) -> None:
+    """Fail before calibration if a requested sampler cannot fit a subset."""
+
+    if candidate.imbalance_strategy not in {"smotenc", "smote"}:
+        return
+    try:
+        requested = check_sampling_strategy(candidate.sampling_strategy, labels, "over-sampling")
+    except ValueError as error:
+        raise ValueError(f"{context}: invalid calibration sampling_strategy: {error}") from error
+    for label, n_new in requested.items():
+        n_available = int(np.count_nonzero(labels == label))
+        if n_new > 0 and n_available <= candidate.k_neighbors:
+            raise ValueError(
+                f"{context}: calibration sampler requires more than k_neighbors="
+                f"{candidate.k_neighbors} training rows in each resampled class; "
+                "choose an explicit feasible configuration"
+            )
+
+
+def _calibration_splits(
+    training: pd.DataFrame,
+    labels: np.ndarray,
+    candidate: StaticCandidate,
+    *,
+    random_state: int,
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Return positional, patient-disjoint inner folds within the current train set."""
+
+    _validate_candidates((candidate,))
+    labels = np.asarray(labels)
+    if labels.ndim != 1 or len(labels) != len(training):
+        raise ValueError("Calibration labels must align with the training rows")
+    if not np.array_equal(np.unique(labels), [0, 1]):
+        raise ValueError("Calibration requires both classes with binary labels 0 and 1")
+    if "subject_id" not in training or training["subject_id"].isna().any():
+        raise ValueError("Calibration requires nonmissing subject_id patient groups")
+    groups = training["subject_id"].to_numpy()
+    if training["subject_id"].nunique() < candidate.calibration_n_splits:
+        raise ValueError("Not enough patient groups for calibration_n_splits")
+
+    splitter = StratifiedGroupKFold(
+        n_splits=candidate.calibration_n_splits, shuffle=True, random_state=random_state,
+    )
+    inner_splits = list(splitter.split(training, labels, groups=groups))
+    coverage = np.zeros(len(training), dtype=np.int8)
+    _validate_calibration_sampling(labels, candidate, context="Full calibration training set")
+    for fold, (train_idx, valid_idx) in enumerate(inner_splits):
+        if not len(train_idx) or not len(valid_idx):
+            raise ValueError(f"Calibration fold {fold} has an empty training or validation set")
+        if np.intersect1d(groups[train_idx], groups[valid_idx]).size:
+            raise ValueError(f"Patient overlap in calibration fold {fold}")
+        for indices in (train_idx, valid_idx):
+            if not np.array_equal(np.unique(labels[indices]), [0, 1]):
+                raise ValueError(
+                    f"Calibration fold {fold}: both classes are required in training and validation"
+                )
+        _validate_calibration_sampling(
+            labels[train_idx], candidate, context=f"Calibration fold {fold}",
+        )
+        coverage[valid_idx] += 1
+    if not np.all(coverage == 1):
+        raise ValueError("Each calibration row must receive exactly one inner OOF score")
+    return inner_splits
+
+
+def _fit_candidate_predictor(
+    training: pd.DataFrame,
+    labels: np.ndarray,
+    candidate: StaticCandidate,
+    estimator_factory: EstimatorFactory,
+    *,
+    random_state: int,
+) -> BaseEstimator:
+    """Fit a plain pipeline or a grouped, internally calibrated predictor.
+
+    The caller must pass only the current outer-training (or final dev) rows.
+    No outer validation or holdout rows enter calibration. With ensemble=False,
+    sklearn fits the sigmoid on inner OOF scores and refits the base estimator
+    on ALL current training rows; do not add another fit after this helper.
+    """
+
+    labels = np.asarray(labels)
+    if candidate.calibration_method is None:
+        return _fit_plain_candidate(
+            training, labels, candidate, estimator_factory, random_state=random_state,
+        )
+    inner_splits = _calibration_splits(
+        training, labels, candidate, random_state=random_state,
+    )
+    calibrated = CalibratedClassifierCV(
+        estimator=FoldLocalStaticClassifier(candidate, estimator_factory, random_state),
+        method=candidate.calibration_method,
+        cv=inner_splits,
+        ensemble=False,
+        n_jobs=1,
+    )
+    # Calibration sees original held-out rows and no sample/class weights.
+    calibrated.fit(training, labels)
+    return calibrated
 
 
 def _positive_probabilities(estimator: BaseEstimator, frame: pd.DataFrame) -> np.ndarray:
@@ -338,23 +524,13 @@ def _fit_candidate_oof(
         training = frame.iloc[train_indices]
         validation = frame.iloc[validation_indices]
         train_labels = labels[train_indices]
+        # Report the outer-full-refit weight; inner calibration weights are
+        # independently recomputed by FoldLocalStaticClassifier.fit.
         positive_weight = _fold_positive_weight(train_labels, candidate)
-        estimator = estimator_factory(candidate.estimator_params, positive_weight)
-        pipeline = build_static_resampling_pipeline(
-            training,
-            estimator,
-            imbalance_strategy=candidate.imbalance_strategy,
-            sampling_strategy=(
-                candidate.sampling_strategy
-                if candidate.sampling_strategy is not None
-                else "auto"
-            ),
-            k_neighbors=candidate.k_neighbors,
-            scale_numeric=candidate.scale_numeric,
-            random_state=random_state,
-        )
         started_at = perf_counter()
-        pipeline.fit(training, train_labels)
+        pipeline = _fit_candidate_predictor(
+            training, train_labels, candidate, estimator_factory, random_state=random_state,
+        )
         fit_seconds = perf_counter() - started_at
         probabilities = _positive_probabilities(pipeline, validation)
         oof[validation_indices] = probabilities
@@ -611,22 +787,11 @@ def _train_static_model(
     else:
         development = frame.iloc[splits.dev_indices]
         development_labels = development["label"].to_numpy(dtype=np.int8)
-        positive_weight = _fold_positive_weight(development_labels, best_candidate)
-        final_pipeline = build_static_resampling_pipeline(
-            development,
-            estimator_factory(best_candidate.estimator_params, positive_weight),
-            imbalance_strategy=best_candidate.imbalance_strategy,
-            sampling_strategy=(
-                best_candidate.sampling_strategy
-                if best_candidate.sampling_strategy is not None
-                else "auto"
-            ),
-            k_neighbors=best_candidate.k_neighbors,
-            scale_numeric=best_candidate.scale_numeric,
+        final_started_at = perf_counter()
+        final_pipeline = _fit_candidate_predictor(
+            development, development_labels, best_candidate, estimator_factory,
             random_state=random_state,
         )
-        final_started_at = perf_counter()
-        final_pipeline.fit(development, development_labels)
         final_fit_seconds = perf_counter() - final_started_at
         if checkpoint is not None:
             checkpoint.save_final(best_candidate.name, final_pipeline, final_fit_seconds)
@@ -868,7 +1033,10 @@ def logistic_regression_candidates(
         for strategy in strategies:
             candidates.append(
                 StaticCandidate(
-                    name=f"lr_{model_params.get("penalty")}_c{model_params.get("c_value"):g}_{strategy['strategy_name']}",
+                    name=(
+                        f"lr_{model_params.get('penalty')}_c{model_params.get('c_value'):g}"
+                        f"_{strategy['strategy_name']}"
+                    ),
                     strategy_name=str(strategy["strategy_name"]),
                     estimator_params={"C": model_params.get("c_value"), "penalty": model_params.get("penalty")},
                     imbalance_strategy=str(strategy["imbalance_strategy"]),
@@ -1033,6 +1201,120 @@ def train_random_forest(
     )
 
 
+def svm_candidates(*, profile: str = "tuning") -> tuple[StaticCandidate, ...]:
+    """Build calibrated SVM candidates: smoke=3, screening=6, tuning=36.
+
+    Linear kernels search C only; RBF kernels search C and gamma. Each model
+    configuration uses identical frozen outer folds and grouped inner folds.
+    """
+
+    if profile not in {"smoke", "screening", "tuning"}:
+        raise ValueError("profile must be either 'smoke', 'screening' or 'tuning'")
+    ratios = {
+        "smoke": (0.25,),
+        "screening": (0.10, 0.25, 0.50, 1.00),
+        "tuning": (0.10,),
+    }[profile]
+    strategies = (
+        {"strategy_name": "baseline", "imbalance_strategy": "none"},
+        {
+            "strategy_name": "class_weight",
+            "imbalance_strategy": "cost_sensitive",
+            "positive_weight_multiplier": 1.0,
+        },
+        *(
+            {
+                "strategy_name": f"smotenc_{ratio:.2f}",
+                "imbalance_strategy": "smotenc",
+                "sampling_strategy": ratio,
+            }
+            for ratio in ratios
+        ),
+    )
+    if profile == "tuning":
+        model_grid = ParameterGrid([
+            {"kernel": ("linear",), "C": (0.1, 1.0, 10.0)},
+            {
+                "kernel": ("rbf",),
+                "C": (0.1, 1.0, 10.0),
+                "gamma": ("scale", 0.01, 0.1),
+            },
+        ])
+    else:
+        model_grid = ParameterGrid({"kernel": ("rbf",), "C": (1.0,), "gamma": ("scale",)})
+
+    candidates = []
+    for idx, model_params in enumerate(model_grid, start=1):
+        for strategy in strategies:
+            candidates.append(StaticCandidate(
+                name=f"svm_cfg{idx}_{strategy['strategy_name']}",
+                strategy_name=str(strategy["strategy_name"]),
+                estimator_params=dict(model_params),
+                imbalance_strategy=str(strategy["imbalance_strategy"]),
+                sampling_strategy=strategy.get("sampling_strategy"),
+                positive_weight_multiplier=strategy.get("positive_weight_multiplier"),
+                scale_numeric=True,
+                calibration_method="sigmoid",
+                calibration_n_splits=3,
+            ))
+    return tuple(candidates)
+
+
+def build_svm(
+    params: Mapping[str, Any],
+    positive_weight: float | None,
+) -> SVC:
+    """Build a CPU SVC that exposes scores; grouped calibration supplies probabilities."""
+
+    if "probability" in params:
+        raise ValueError("Omit SVC probability; use patient-grouped sigmoid calibration instead")
+    if "class_weight" in params:
+        raise ValueError("Put class weighting in positive_weight_multiplier")
+    if positive_weight is not None and (
+        not np.isfinite(positive_weight) or positive_weight <= 0
+    ):
+        raise ValueError("positive_weight must be finite and positive")
+    estimator_params = {
+        "cache_size": 1024,
+        "tol": 1e-3,
+        "max_iter": -1,
+        **dict(params),
+    }
+    estimator_params["class_weight"] = (
+        None if positive_weight is None else {0: 1.0, 1: positive_weight}
+    )
+    # Omit the version-dependent/deprecated probability flag altogether.
+    return SVC(**estimator_params)
+
+
+def train_svm(
+    frame: pd.DataFrame,
+    splits: PatientSplits,
+    *,
+    profile: str = "tuning",
+    progress_callback: ProgressCallback | None = None,
+    checkpoint_dir: Path | None = None,
+    resume: bool = True,
+) -> StaticTrainingResult:
+    """Cross-fit SVM with grouped inner calibration, then refit the winner on dev.
+
+    Checkpoints remain outer-fold granular: interrupted inner calibration is
+    rerun with its unfinished outer fold. Three inner folds cost four SVC fits
+    per outer fold, plus four fits for the final development model.
+    """
+
+    return train_static_model(
+        model_name="svm",
+        frame=frame,
+        splits=splits,
+        candidates=svm_candidates(profile=profile),
+        estimator_factory=build_svm,
+        progress_callback=progress_callback,
+        checkpoint_dir=checkpoint_dir,
+        resume=resume,
+    )
+
+
 def save_static_training_result(
     result: StaticTrainingResult,
     *,
@@ -1149,6 +1431,36 @@ def run_random_forest_stage4(
         assignments_path=assignments_path,
     )
     result = train_random_forest(
+        frame=frame,
+        splits=splits,
+        profile=profile,
+        progress_callback=progress_callback,
+        checkpoint_dir=checkpoint_dir,
+        resume=resume,
+    )
+    artifacts = save_static_training_result(
+        result=result,
+        artifact_suffix="smoke" if profile == "smoke" else "",
+    )
+    return result, artifacts
+
+
+def run_svm_stage4(
+    *,
+    profile: str = "tuning",
+    static_path: Path = STATIC_FEATURES_PATH,
+    assignments_path: Path = SPLIT_ASSIGNMENTS_PATH,
+    progress_callback: ProgressCallback | None = None,
+    checkpoint_dir: Path | None = None,
+    resume: bool = True,
+) -> tuple[StaticTrainingResult, StaticModelArtifacts]:
+    """Load protected inputs, train calibrated SVM and save the final predictor."""
+
+    frame, splits = load_static_stage4_inputs(
+        static_path=static_path,
+        assignments_path=assignments_path,
+    )
+    result = train_svm(
         frame=frame,
         splits=splits,
         profile=profile,

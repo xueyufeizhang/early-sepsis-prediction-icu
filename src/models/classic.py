@@ -2,6 +2,7 @@
 
 LR, XGBoost and Random Forest use the shared imbalance-aware framework. SVM
 adds patient-grouped, fold-local sigmoid calibration to produce probabilities.
+PyTorch MLP uses a grouped inner validation set to choose its training budget.
 
 Patient-level OOF predictions are protected PhysioNet derivatives and are
 saved only under the gitignored ``data/`` workspace.
@@ -10,7 +11,7 @@ saved only under the gitignored ``data/`` workspace.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from hashlib import sha256
 from importlib.metadata import version
 import inspect
@@ -48,6 +49,7 @@ from ..splits import (
     SPLIT_ASSIGNMENTS_PATH,
     PatientSplits,
     build_static_resampling_pipeline,
+    grouped_train_test_split,
     validate_patient_splits,
 )
 from .checkpoints import TrainingCheckpoint
@@ -71,6 +73,7 @@ class StaticCandidate:
     scale_numeric: bool = True
     calibration_method: str | None = None
     calibration_n_splits: int = 3
+    training_backend: str = "sklearn"
 
     def as_dict(self) -> dict[str, Any]:
         """Return a serialisable description suitable for aggregate tables."""
@@ -85,6 +88,7 @@ class StaticCandidate:
             "scale_numeric": self.scale_numeric,
             "calibration_method": self.calibration_method,
             "calibration_n_splits": self.calibration_n_splits,
+            "training_backend": self.training_backend,
             "estimator_params": json.dumps(
                 dict(self.estimator_params), sort_keys=True, separators=(",", ":")
             ),
@@ -168,8 +172,11 @@ def _checkpoint_manifest(
     """Refuse stale folds after data, configuration, code or environment changes."""
 
     descriptions = []
+    torch_devices = set()
     for candidate in candidates:
         estimator = estimator_factory(candidate.estimator_params, None)
+        if candidate.training_backend == "torch_mlp":
+            torch_devices.add(str(estimator.get_params()["device"]))
         descriptions.append({
             "candidate": candidate.as_dict(),
             "estimator_class": f"{type(estimator).__module__}.{type(estimator).__qualname__}",
@@ -179,6 +186,32 @@ def _checkpoint_manifest(
     source_files = (
         "models/classic.py", "models/checkpoints.py", "splits.py", "features.py", "config.py"
     )
+    torch_runtime = {}
+    if any(candidate.training_backend == "torch_mlp" for candidate in candidates):
+        import torch
+
+        source_files += ("models/mlp.py",)
+        resolved_devices = []
+        for requested in sorted(torch_devices):
+            device = torch.device(requested)
+            resolved = str(device)
+            if device.type == "cuda" and device.index is None:
+                resolved = (
+                    f"cuda:{torch.cuda.current_device()}"
+                    if torch.cuda.is_available()
+                    else "cuda:unavailable"
+                )
+            resolved_devices.append({"requested": requested, "resolved": resolved})
+        torch_runtime = {
+            "torch": version("torch"),
+            "cuda_runtime": torch.version.cuda,
+            "cudnn": torch.backends.cudnn.version(),
+            "cpu_threads": torch.get_num_threads(),
+            "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
+            "cudnn_deterministic": torch.backends.cudnn.deterministic,
+            "cudnn_benchmark": torch.backends.cudnn.benchmark,
+            "training_devices": resolved_devices,
+        }
     return _checkpoint_json_value({
         "model_name": model_name,
         "random_state": random_state,
@@ -199,6 +232,7 @@ def _checkpoint_manifest(
             name: sha256((source_root / name).read_bytes()).hexdigest()
             for name in source_files
         },
+        "torch_runtime": torch_runtime,
     })
 
 
@@ -252,6 +286,13 @@ def _validate_candidates(candidates: Sequence[StaticCandidate]) -> None:
         raise ValueError("Candidate names must be unique")
 
     for candidate in candidates:
+        if candidate.training_backend not in {"sklearn", "torch_mlp"}:
+            raise ValueError("training_backend must be 'sklearn' or 'torch_mlp'")
+        if candidate.training_backend == "torch_mlp":
+            if candidate.calibration_method is not None:
+                raise ValueError("Torch MLP does not use the SVM calibration branch")
+            if not candidate.scale_numeric:
+                raise ValueError("Torch MLP candidates must enable scale_numeric")
         if candidate.calibration_method not in {None, "sigmoid"}:
             raise ValueError("calibration_method must be None or 'sigmoid'")
         if (
@@ -364,22 +405,22 @@ class FoldLocalStaticClassifier(ClassifierMixin, BaseEstimator):
         return self.pipeline_.predict(X)
 
 
-def _validate_calibration_sampling(
+def _validate_training_sampling(
     labels: np.ndarray, candidate: StaticCandidate, *, context: str,
 ) -> None:
-    """Fail before calibration if a requested sampler cannot fit a subset."""
+    """Fail before fitting if a requested sampler cannot fit a training subset."""
 
     if candidate.imbalance_strategy not in {"smotenc", "smote"}:
         return
     try:
         requested = check_sampling_strategy(candidate.sampling_strategy, labels, "over-sampling")
     except ValueError as error:
-        raise ValueError(f"{context}: invalid calibration sampling_strategy: {error}") from error
+        raise ValueError(f"{context}: invalid sampling_strategy: {error}") from error
     for label, n_new in requested.items():
         n_available = int(np.count_nonzero(labels == label))
         if n_new > 0 and n_available <= candidate.k_neighbors:
             raise ValueError(
-                f"{context}: calibration sampler requires more than k_neighbors="
+                f"{context}: sampler requires more than k_neighbors="
                 f"{candidate.k_neighbors} training rows in each resampled class; "
                 "choose an explicit feasible configuration"
             )
@@ -411,7 +452,7 @@ def _calibration_splits(
     )
     inner_splits = list(splitter.split(training, labels, groups=groups))
     coverage = np.zeros(len(training), dtype=np.int8)
-    _validate_calibration_sampling(labels, candidate, context="Full calibration training set")
+    _validate_training_sampling(labels, candidate, context="Full calibration training set")
     for fold, (train_idx, valid_idx) in enumerate(inner_splits):
         if not len(train_idx) or not len(valid_idx):
             raise ValueError(f"Calibration fold {fold} has an empty training or validation set")
@@ -422,13 +463,123 @@ def _calibration_splits(
                 raise ValueError(
                     f"Calibration fold {fold}: both classes are required in training and validation"
                 )
-        _validate_calibration_sampling(
+        _validate_training_sampling(
             labels[train_idx], candidate, context=f"Calibration fold {fold}",
         )
         coverage[valid_idx] += 1
     if not np.all(coverage == 1):
         raise ValueError("Each calibration row must receive exactly one inner OOF score")
     return inner_splits
+
+
+def _fit_torch_mlp_candidate(
+    training: pd.DataFrame,
+    labels: np.ndarray,
+    candidate: StaticCandidate,
+    estimator_factory: EstimatorFactory,
+    *,
+    random_state: int,
+) -> BaseEstimator:
+    """Select an epoch on a grouped inner holdout, then refit on all current rows.
+
+    Splitting precedes schema discovery, imputation, scaling and SMOTENC. The
+    inner holdout selects epochs only; the outer validation remains exclusively
+    for OOF evaluation. Refit creates fresh preprocessing and network weights.
+    """
+
+    from .mlp import TorchMLPClassifier
+
+    _validate_candidates((candidate,))
+    labels = np.asarray(labels)
+    if labels.ndim != 1 or len(labels) != len(training):
+        raise ValueError("MLP labels must align with the current training rows")
+    if not np.array_equal(np.unique(labels), [0, 1]):
+        raise ValueError("MLP training requires both binary classes 0 and 1")
+    configured = estimator_factory(candidate.estimator_params, None)
+    if not isinstance(configured, TorchMLPClassifier):
+        raise TypeError("training_backend='torch_mlp' requires TorchMLPClassifier")
+
+    if not configured.early_stopping:
+        fixed = replace(
+            candidate, estimator_params={**candidate.estimator_params, "random_state": random_state},
+        )
+        return _fit_plain_candidate(
+            training, labels, fixed, estimator_factory, random_state=random_state,
+        )
+
+    fit_idx, stopping_idx = grouped_train_test_split(
+        training.assign(label=labels),
+        test_size=configured.validation_fraction,
+        random_state=random_state,
+    )
+    inner_training = training.iloc[fit_idx]
+    inner_validation = training.iloc[stopping_idx]
+    inner_labels = labels[fit_idx]
+    stopping_labels = labels[stopping_idx]
+    _validate_training_sampling(labels, candidate, context="Full MLP training set")
+    _validate_training_sampling(inner_labels, candidate, context="MLP inner training set")
+    inner_weight = _fold_positive_weight(inner_labels, candidate)
+    selector = estimator_factory(candidate.estimator_params, inner_weight)
+    selector.set_params(random_state=random_state)
+    selection_pipeline = build_static_resampling_pipeline(
+        inner_training,
+        selector,
+        imbalance_strategy=candidate.imbalance_strategy,
+        sampling_strategy=(
+            candidate.sampling_strategy if candidate.sampling_strategy is not None else "auto"
+        ),
+        k_neighbors=candidate.k_neighbors,
+        scale_numeric=candidate.scale_numeric,
+        random_state=random_state,
+    )
+
+    # Public transformer/sampler APIs preserve resampled y and make it explicit
+    # that the early-stop rows are ONLY transformed, never fitted or sampled.
+    fit_features, stop_features, fit_labels = inner_training, inner_validation, inner_labels
+    for _, step in selection_pipeline.steps[:-1]:
+        if hasattr(step, "fit_resample"):
+            fit_features, fit_labels = step.fit_resample(fit_features, fit_labels)
+        else:
+            fit_features = step.fit_transform(fit_features, fit_labels)
+            stop_features = step.transform(stop_features)
+    selector.fit(
+        fit_features, fit_labels, validation_data=(stop_features, stopping_labels),
+    )
+    selected_epochs = int(selector.best_epoch_)
+    summary = {
+        "best_epoch": selected_epochs,
+        "best_validation_auroc": float(selector.best_validation_auroc_),
+        "selection_epochs": int(selector.n_epochs_),
+        "history": selector.history_,
+        "n_inner_train": len(fit_idx),
+        "n_inner_validation": len(stopping_idx),
+        "inner_positive_weight": inner_weight,
+    }
+    refit_candidate = replace(candidate, estimator_params={
+        **candidate.estimator_params,
+        "early_stopping": False,
+        "max_epochs": selected_epochs,
+        "random_state": random_state,
+    })
+    final_pipeline = _fit_plain_candidate(
+        training, labels, refit_candidate, estimator_factory, random_state=random_state,
+    )
+    final_pipeline.named_steps["estimator"].early_stopping_summary_ = summary
+    return final_pipeline
+
+
+def _training_diagnostics(predictor: BaseEstimator, candidate: StaticCandidate) -> dict[str, Any]:
+    """Small, aggregate-only MLP diagnostics suitable for fold checkpoints/tables."""
+
+    if candidate.training_backend != "torch_mlp":
+        return {}
+    estimator = predictor.named_steps["estimator"]
+    summary = getattr(estimator, "early_stopping_summary_", {})
+    return {
+        "selected_epochs": int(estimator.n_epochs_),
+        "selection_epochs": summary.get("selection_epochs"),
+        "inner_validation_auroc": summary.get("best_validation_auroc"),
+    }
 
 
 def _fit_candidate_predictor(
@@ -448,6 +599,10 @@ def _fit_candidate_predictor(
     """
 
     labels = np.asarray(labels)
+    if candidate.training_backend == "torch_mlp":
+        return _fit_torch_mlp_candidate(
+            training, labels, candidate, estimator_factory, random_state=random_state,
+        )
     if candidate.calibration_method is None:
         return _fit_plain_candidate(
             training, labels, candidate, estimator_factory, random_state=random_state,
@@ -548,6 +703,7 @@ def _fit_candidate_oof(
                 "auprc": float(average_precision_score(y_validation, probabilities)),
                 "brier_score": float(brier_score_loss(y_validation, probabilities)),
                 "fit_seconds": fit_seconds,
+                **_training_diagnostics(pipeline, candidate),
             }
         )
         if checkpoint is not None:
@@ -1315,6 +1471,111 @@ def train_svm(
     )
 
 
+def mlp_candidates(*, profile: str = "tuning") -> tuple[StaticCandidate, ...]:
+    """PyTorch MLP: three smoke candidates or ten network configs x three strategies."""
+
+    if profile not in {"smoke", "screening", "tuning"}:
+        raise ValueError("profile must be either 'smoke', 'screening' or 'tuning'")
+    ratios = {
+        "smoke": (0.25,),
+        "screening": (0.10, 0.25, 0.50, 1.00),
+        "tuning": (0.10,),
+    }[profile]
+    strategies = (
+        {"strategy_name": "baseline", "imbalance_strategy": "none"},
+        {
+            "strategy_name": "class_weight", "imbalance_strategy": "cost_sensitive",
+            "positive_weight_multiplier": 1.0,
+        },
+        *(
+            {
+                "strategy_name": f"smotenc_{ratio:.2f}", "imbalance_strategy": "smotenc",
+                "sampling_strategy": ratio,
+            }
+            for ratio in ratios
+        ),
+    )
+    if profile == "tuning":
+        model_grid = ParameterSampler({
+            "hidden_layer_sizes": ((64,), (128, 64), (256, 128)),
+            "dropout": (0.0, 0.2, 0.4),
+            "learning_rate": (1e-4, 3e-4, 1e-3),
+            "weight_decay": (1e-5, 1e-4, 1e-3),
+            "batch_size": (64, 128, 256),
+        }, n_iter=10, random_state=RANDOM_SEED)
+    else:
+        model_grid = ({
+            "hidden_layer_sizes": (64,), "dropout": 0.2, "learning_rate": 1e-3,
+            "weight_decay": 1e-4, "batch_size": 128,
+        },)
+    candidates = []
+    for idx, params in enumerate(model_grid, start=1):
+        for strategy in strategies:
+            candidates.append(StaticCandidate(
+                name=f"mlp_cfg{idx}_{strategy['strategy_name']}",
+                strategy_name=str(strategy["strategy_name"]),
+                estimator_params={
+                    **params,
+                    "max_epochs": 5 if profile == "smoke" else 100,
+                    "early_stopping": True,
+                    "validation_fraction": 0.2,
+                    "patience": 3 if profile == "smoke" else 10,
+                    "min_delta": 1e-4,
+                },
+                imbalance_strategy=str(strategy["imbalance_strategy"]),
+                sampling_strategy=strategy.get("sampling_strategy"),
+                positive_weight_multiplier=strategy.get("positive_weight_multiplier"),
+                scale_numeric=True,
+                training_backend="torch_mlp",
+            ))
+    return tuple(candidates)
+
+
+def build_mlp(
+    params: Mapping[str, Any],
+    positive_weight: float | None,
+    *,
+    device: str = "cpu",
+) -> BaseEstimator:
+    """Build the torch estimator; loss weighting remains a fold-local decision."""
+
+    from .mlp import TorchMLPClassifier
+
+    if {"positive_weight", "pos_weight", "class_weight"}.intersection(params):
+        raise ValueError("Put class weighting in positive_weight_multiplier")
+    if "device" in params:
+        raise ValueError("Pass device explicitly to build_mlp/train_mlp")
+    if positive_weight is not None and (
+        not np.isfinite(positive_weight) or positive_weight <= 0
+    ):
+        raise ValueError("positive_weight must be finite and positive")
+    return TorchMLPClassifier(**dict(params), positive_weight=positive_weight, device=device)
+
+
+def train_mlp(
+    frame: pd.DataFrame,
+    splits: PatientSplits,
+    *,
+    profile: str = "tuning",
+    device: str = "cpu",
+    progress_callback: ProgressCallback | None = None,
+    checkpoint_dir: Path | None = None,
+    resume: bool = True,
+) -> StaticTrainingResult:
+    """Train the PyTorch static MLP with grouped epoch selection and full-train refits."""
+
+    return train_static_model(
+        model_name="mlp",
+        frame=frame,
+        splits=splits,
+        candidates=mlp_candidates(profile=profile),
+        estimator_factory=partial(build_mlp, device=device),
+        progress_callback=progress_callback,
+        checkpoint_dir=checkpoint_dir,
+        resume=resume,
+    )
+
+
 def save_static_training_result(
     result: StaticTrainingResult,
     *,
@@ -1349,6 +1610,10 @@ def save_static_training_result(
     best_summary = result.best_candidate.as_dict()
     best_summary.update(result.candidate_metrics.iloc[0].to_dict())
     best_summary["final_fit_seconds"] = result.final_fit_seconds
+    best_summary.update({
+        f"final_{key}": value
+        for key, value in _training_diagnostics(result.final_pipeline, result.best_candidate).items()
+    })
     pd.DataFrame([best_summary]).to_csv(best_params_path, index=False)
     return StaticModelArtifacts(
         model_path=model_path,
@@ -1471,5 +1736,30 @@ def run_svm_stage4(
     artifacts = save_static_training_result(
         result=result,
         artifact_suffix="smoke" if profile == "smoke" else "",
+    )
+    return result, artifacts
+
+
+def run_mlp_stage4(
+    *,
+    profile: str = "tuning",
+    device: str = "cpu",
+    static_path: Path = STATIC_FEATURES_PATH,
+    assignments_path: Path = SPLIT_ASSIGNMENTS_PATH,
+    progress_callback: ProgressCallback | None = None,
+    checkpoint_dir: Path | None = None,
+    resume: bool = True,
+) -> tuple[StaticTrainingResult, StaticModelArtifacts]:
+    """Load protected static inputs, train torch MLP and save its full inference pipeline."""
+
+    frame, splits = load_static_stage4_inputs(
+        static_path=static_path, assignments_path=assignments_path,
+    )
+    result = train_mlp(
+        frame, splits, profile=profile, device=device,
+        progress_callback=progress_callback, checkpoint_dir=checkpoint_dir, resume=resume,
+    )
+    artifacts = save_static_training_result(
+        result, artifact_suffix="smoke" if profile == "smoke" else "",
     )
     return result, artifacts

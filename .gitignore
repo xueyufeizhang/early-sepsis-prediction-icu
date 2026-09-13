@@ -72,5 +72,6 @@ env/
 
 # --- Local-only planning and research material (never publish) ---
 /scratch/
+/docs/
 /AGENTS.md
 /project_brief.md

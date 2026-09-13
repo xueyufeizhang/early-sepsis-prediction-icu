@@ -31,9 +31,9 @@ enforces the no-commit rule — do not weaken it.
 
 This public repository contains only project deliverables and the material
 needed to reproduce them: source code, SQL concepts, notebooks, safe aggregate
-results/figures, and presentation slides. Local planning notes, personal
-certificates, credentials, research papers, and the private reference library
-are intentionally excluded from version control.
+results/figures, and presentation slides. Local study notes (`docs/`), planning
+notes, personal certificates, credentials, research papers, and the private
+reference library are intentionally excluded from version control.
 
 ## Repository layout
 
@@ -45,7 +45,7 @@ src/
   cohort.py                    Stage 1: cohort extraction + N/M windowing + labels
   features.py                  Stage 2: static + hourly time-series matrices
   splits.py                    Stage 3: patient-grouped split + SMOTE
-  models/                      Stage 4: classic ML (classic.py) + LSTM (deep.py)
+  models/                      Stage 4: static orchestration (classic.py), Torch MLP (mlp.py), LSTM (deep.py)
   evaluate.py                  Stage 5: metrics, ROC/PR/calibration, stat tests
   external.py                  Stage 6: eICU + MIMIC-III validation
   interpret.py                 Stage 7: SHAP + subgroup/bias audit
@@ -94,14 +94,22 @@ No patient-level artifact is stored in this repository.
 
 Stage 3 has passed its controlled run: 28,820 patients were divided into a
 23,056-row development set and a sealed 5,764-row internal test set, with five
-frozen patient-grouped development folds. Stage 4 now provides a reusable
-static-model cross-fitting framework and the Logistic Regression baseline in
-`src/models/classic.py`. Run `notebooks/04_models.ipynb` beside the protected
-Stage-2/3 artifacts: first complete the three-candidate smoke run, then explicitly
-enable the six-candidate LR imbalance screening across baseline, fold-derived
-class weighting, and four SMOTENC ratios. XGBoost also implements this screening;
-the remaining models are left for later Stage-4 milestones. Internal-test
-prediction and final threshold selection remain deferred to Stage 5.
+frozen patient-grouped development folds. Stage 4 provides a reusable static-model
+cross-fitting framework for Logistic Regression, XGBoost, Random Forest, SVM and
+PyTorch MLP. LR/XGBoost/RF support three-candidate smoke and 30-candidate tuning
+profiles; LR/XGBoost also expose six-candidate imbalance screening. SVM adds
+grouped probability calibration, and MLP adds grouped early stopping. The hourly
+LSTM remains a separate milestone. Internal-test prediction and final threshold
+selection remain deferred to Stage 5.
+
+Run `notebooks/04_models.ipynb` beside the protected Stage-2/3 artifacts. Its current
+LR/XGBoost cells still call smoke/screening; RF cells have not been added to this
+repository copy. Their `train_logistic_regression`, `train_xgboost` and
+`train_random_forest` entry points in `src/models/classic.py` accept
+`profile="tuning"`. SVM and MLP have their own gated smoke/tuning sections.
+Check actual `profile` arguments when comparing with a separately edited Kaggle
+copy. Pass a private `checkpoint_dir` to enable fold-level recovery, and use a
+new directory and output suffix when changing an experiment.
 
 SMOTENC now runs **after numeric imputation/scaling fitted only on original
 training-fold rows**, and before categorical one-hot encoding. No scaler is

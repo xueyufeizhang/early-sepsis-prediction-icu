@@ -45,7 +45,7 @@ src/
   cohort.py                    Stage 1: cohort extraction + N/M windowing + labels
   features.py                  Stage 2: static + hourly time-series matrices
   splits.py                    Stage 3: patient-grouped split + SMOTE
-  models/                      Stage 4: static orchestration (classic.py), Torch MLP (mlp.py), LSTM (deep.py)
+  models/                      Stage 4: static orchestration (classic.py), Torch MLP (mlp.py), LSTM (lstm.py)
   evaluate.py                  Stage 5: metrics, ROC/PR/calibration, stat tests
   external.py                  Stage 6: eICU + MIMIC-III validation
   interpret.py                 Stage 7: SHAP + subgroup/bias audit
@@ -94,34 +94,35 @@ No patient-level artifact is stored in this repository.
 
 Stage 3 has passed its controlled run: 28,820 patients were divided into a
 23,056-row development set and a sealed 5,764-row internal test set, with five
-frozen patient-grouped development folds. Stage 4 provides a reusable static-model
-cross-fitting framework for Logistic Regression, XGBoost, Random Forest, SVM and
-PyTorch MLP. LR/XGBoost/RF support three-candidate smoke and 30-candidate tuning
-profiles; LR/XGBoost also expose six-candidate imbalance screening. SVM adds
-grouped probability calibration, and MLP adds grouped early stopping. The hourly
-LSTM remains a separate milestone. Internal-test prediction and final threshold
-selection remain deferred to Stage 5.
+frozen patient-grouped development folds. Stage 4 trains LR, XGBoost, RF, SVM and
+PyTorch MLP through one shared workflow. SVM uses grouped probability
+calibration; MLP uses grouped early stopping. The hourly LSTM is in progress.
+Internal-test prediction and F1 threshold selection belong to Stage 5.
 
-Run `notebooks/04_models.ipynb` beside the protected Stage-2/3 artifacts. Its current
-LR/XGBoost cells still call smoke/screening; RF cells have not been added to this
-repository copy. Their `train_logistic_regression`, `train_xgboost` and
-`train_random_forest` entry points in `src/models/classic.py` accept
-`profile="tuning"`. SVM and MLP have their own gated smoke/tuning sections.
-Check actual `profile` arguments when comparing with a separately edited Kaggle
-copy. Pass a private `checkpoint_dir` to enable fold-level recovery, and use a
-new directory and output suffix when changing an experiment.
+Run `notebooks/04_models.ipynb` beside the protected Stage-2/3 artifacts. Start
+with `profile="smoke"`; use `"screening"` for LR/XGBoost imbalance comparisons or
+`"tuning"` for model optimization. RF is available through
+`train_random_forest` in `src/models/classic.py`; it has no notebook section yet.
 
-SMOTENC now runs **after numeric imputation/scaling fitted only on original
-training-fold rows**, and before categorical one-hot encoding. No scaler is
-refitted on the augmented sample. This distance-scaling step is mandatory even
-for XGBoost or when optional model scaling is disabled. Baseline and
-class-weighted feature values remain equivalent to their previous pipeline.
+Static models share `build_static_resampling_pipeline` in `src/splits.py`.
+Imputation and numeric scaling are fitted on original training-fold rows;
+SMOTENC runs next, followed by categorical one-hot encoding. This scaling is
+required for SMOTENC even with tree models. The old Stage-3-only preprocessing
+helpers have been removed; its notebook now uses the same preprocessing steps.
 
-After this correction, restart the notebook kernel and rerun Stage 4 using the
-existing Stage-2/3 artifacts; do not recreate patient splits. The notebook saves
-the corrected screening under `smotenc_scaled_v2` (with an additional `_smoke`
-suffix for smoke runs), preserving the previous artifacts. The optional
-`RUN_SMOTENC_QUALITY_AUDIT` cell reports aggregate synthetic-feature diagnostics
-on one training fold. Fractional counts and inconsistent missingness/count
-relationships are reported, not silently repaired; passing a scaling test does
-not establish clinical plausibility or guarantee better model performance.
+The code follows the notebook stages directly. `train_static_model` contains the
+candidate/fold loop and result summaries. Extra synthetic-sample audits and
+unused `run_*_stage4` wrappers have been removed.
+
+For recovery, pass a private `checkpoint_dir`. A small manifest checks data,
+splits and model settings. Use one experiment per directory, and choose a new
+directory after changing code or dependencies. The notebook uses fresh suffixes
+for this version; old checkpoints are not compatible. Existing Stage-2 features
+and Stage-3 splits can be reused. Keep model, OOF and checkpoint files inside
+the controlled environment.
+
+Synthetic checks (no clinical data):
+
+```bash
+uv run python -m unittest discover -s tests
+```

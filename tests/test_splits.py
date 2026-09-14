@@ -13,13 +13,10 @@ from src.features import HourlyFeatures, save_hourly_features
 from src.splits import (
     build_patient_splits,
     build_split_summary,
-    build_static_preprocessor,
-    build_static_training_pipeline,
+    build_static_resampling_pipeline,
     compute_pos_weight,
     fit_hourly_preprocessor,
-    get_static_feature_columns,
     run_stage3,
-    smote_resample,
     validate_artifact_alignment,
     validate_patient_splits,
 )
@@ -104,41 +101,29 @@ class PatientSplitTests(unittest.TestCase):
 class PreprocessingTests(unittest.TestCase):
     def test_static_preprocessor_excludes_ids_target_and_race(self) -> None:
         static = _static_frame()
-        columns = get_static_feature_columns(static)
-        self.assertIn("age", columns)
-        self.assertIn("gender", columns)
-        self.assertNotIn("label", columns)
-        self.assertNotIn("race", columns)
-
-        preprocessor = build_static_preprocessor(static)
-        transformed = preprocessor.fit_transform(static)
-        names = preprocessor.get_feature_names_out().tolist()
+        pipeline = build_static_resampling_pipeline(static, LogisticRegression(max_iter=200))
+        pipeline.fit(static, static["label"])
+        transformed = pipeline[:-1].transform(static)
+        names = pipeline[:-1].get_feature_names_out().tolist()
         self.assertEqual(transformed.shape[0], len(static))
         self.assertTrue(np.isfinite(transformed).all())
-        self.assertFalse(any("race" in name for name in names))
+        for excluded in ("subject_id", "stay_id", "hadm_id", "label", "race"):
+            self.assertFalse(any(excluded in name for name in names))
 
     def test_smote_pipeline_resamples_training_data_only(self) -> None:
         static = _static_frame(n_subjects=30, stays_per_subject=1)
         static.loc[:, "label"] = [0] * 20 + [1] * 10
-        pipeline = build_static_training_pipeline(
+        pipeline = build_static_resampling_pipeline(
             static,
             LogisticRegression(max_iter=200),
-            smote_sampling_strategy=0.75,
-            smote_k_neighbors=2,
+            imbalance_strategy="smotenc",
+            sampling_strategy=0.75,
+            k_neighbors=2,
         )
         pipeline.fit(static, static["label"])
         probabilities = pipeline.predict_proba(static)[:, 1]
         self.assertEqual(probabilities.shape, (len(static),))
-        self.assertEqual(pipeline.named_steps["smote"].sampling_strategy, 0.75)
-
-        features = np.arange(60, dtype=float).reshape(30, 2)
-        resampled_x, resampled_y = smote_resample(
-            features,
-            np.array([0] * 20 + [1] * 10),
-            k_neighbors=2,
-        )
-        self.assertEqual(resampled_x.shape[0], 40)
-        self.assertEqual(np.bincount(resampled_y).tolist(), [20, 20])
+        self.assertEqual(pipeline.named_steps["sampler"].sampling_strategy, 0.75)
 
     def test_hourly_statistics_are_fitted_on_training_values_only(self) -> None:
         train = np.array([[[1.0, 10.0]], [[3.0, 14.0]]], dtype=np.float32)

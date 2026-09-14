@@ -11,15 +11,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-import re
 from typing import Any, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
-from pandas.api.types import is_datetime64_any_dtype, is_numeric_dtype
 from sklearn.preprocessing import StandardScaler
 
-from .cohort import COHORT_SQL_FILE, build_query_job_config
+from .cohort import COHORT_SQL_FILE, build_query_job_config, render_stage1_sql
 from .config import (
     AGE_MIN,
     DATA_INTERIM,
@@ -39,18 +37,6 @@ STATIC_FEATURES_PATH = DATA_PROCESSED / "static_features.parquet"
 HOURLY_TENSOR_PATH = DATA_PROCESSED / "hourly_tensor.npz"
 FEATURE_DICTIONARY_PATH = RESULTS_TABLES / "feature_dictionary.csv"
 SUMMARY_STATS_PATH = RESULTS_TABLES / "summary_stats.csv"
-
-FEATURE_EVENT_COLUMNS = (
-    "subject_id",
-    "stay_id",
-    "hadm_id",
-    "charttime",
-    "offset_hours",
-    "hour_bin",
-    "feature_name",
-    "value",
-    "source_table",
-)
 
 # Keep the MIT-LCP column names unchanged for provenance and external mapping.
 VASOACTIVE_FEATURES = (
@@ -224,20 +210,6 @@ class Stage2Artifacts:
     hourly_shape: tuple[int, int, int]
 
 
-def _require_columns(frame: pd.DataFrame, required: Sequence[str], name: str) -> None:
-    missing = sorted(set(required).difference(frame.columns))
-    if missing:
-        raise ValueError(f"{name} is missing columns: {', '.join(missing)}")
-
-
-def _validate_project_id(project_id: str) -> str:
-    """Validate a Google Cloud project ID before inserting it into SQL."""
-
-    if not re.fullmatch(r"[a-z][a-z0-9-]{4,28}[a-z0-9]", project_id):
-        raise ValueError(f"Invalid Google Cloud project id: {project_id!r}")
-    return project_id
-
-
 def render_feature_events_sql(
     cohort_sql_path: Path = COHORT_SQL_FILE,
     feature_sql_path: Path = FEATURE_EVENTS_SQL_FILE,
@@ -245,15 +217,9 @@ def render_feature_events_sql(
 ) -> str:
     """Render the feature query with the exact Stage-1 cohort definition."""
 
-    project = _validate_project_id(source_project)
-    cohort_sql = cohort_sql_path.read_text(encoding="utf-8").strip().removesuffix(";")
-    sql = feature_sql_path.read_text(encoding="utf-8")
-    sql = sql.replace("{{COHORT_SQL}}", cohort_sql)
-    sql = sql.replace("{{SOURCE_PROJECT}}", project)
-    unresolved = sorted(set(re.findall(r"\{\{[A-Z_]+\}\}", sql)))
-    if unresolved:
-        raise ValueError(f"Unresolved SQL placeholders: {', '.join(unresolved)}")
-    return sql
+    cohort_sql = render_stage1_sql(cohort_sql_path, source_project).strip().removesuffix(";")
+    sql = render_stage1_sql(feature_sql_path, source_project)
+    return sql.replace("{{COHORT_SQL}}", cohort_sql)
 
 
 def estimate_feature_query_bytes(
@@ -294,91 +260,19 @@ def load_feature_events(
 
 
 def validate_feature_events(events: pd.DataFrame, n_hours: int = N_HOURS) -> None:
-    """Reject malformed, out-of-window, mislabeled, or leakage-prone events."""
+    """Check the observation window and the event values used for aggregation."""
 
-    if not isinstance(events, pd.DataFrame):
-        raise TypeError("events must be a pandas DataFrame")
-    if n_hours <= 0:
-        raise ValueError("n_hours must be positive")
-    _require_columns(events, FEATURE_EVENT_COLUMNS, "Feature events")
-    if events.empty:
-        raise ValueError("Feature event query returned no rows")
-
-    forbidden = sorted(FORBIDDEN_FEATURE_COLUMNS.intersection(events.columns))
-    if forbidden:
-        raise ValueError(f"Feature events contain forbidden future columns: {forbidden}")
-    if events[["subject_id", "stay_id", "hadm_id"]].isna().any().any():
-        raise ValueError("Feature events contain missing identifiers")
-    if events[["feature_name", "source_table"]].isna().any().any():
-        raise ValueError("Feature provenance metadata contain missing values")
-    if events[["offset_hours", "hour_bin"]].isna().any().any():
-        raise ValueError("Feature timing metadata contain missing values")
-    if events["charttime"].isna().any():
-        raise ValueError("Feature events contain missing charttime")
-    if not is_datetime64_any_dtype(events["charttime"]):
-        raise ValueError("charttime must have a datetime dtype")
-    for column in ("offset_hours", "hour_bin", "value"):
-        if not is_numeric_dtype(events[column]):
-            raise ValueError(f"{column} must be numeric")
-    if events["value"].isna().any() or not np.isfinite(events["value"]).all():
-        raise ValueError("Feature values contain NaN or infinity")
-
-    offsets = events["offset_hours"].to_numpy(dtype=float)
-    bins = events["hour_bin"].to_numpy(dtype=float)
-    if not np.isfinite(offsets).all() or not np.isfinite(bins).all():
-        raise ValueError("Feature timing metadata contain NaN or infinity")
-    if not events["offset_hours"].between(0, n_hours).all():
+    if events.empty or not events["offset_hours"].between(0, n_hours).all():
         raise ValueError("Feature events fall outside the observation window")
-    if not events["hour_bin"].between(0, n_hours - 1).all():
-        raise ValueError("Invalid hourly bins")
-    if not np.equal(bins, np.floor(bins)).all():
-        raise ValueError("hour_bin must contain integers")
-    expected_bins = np.minimum(np.floor(offsets), n_hours - 1)
-    if not np.array_equal(bins, expected_bins):
+    expected_bins = np.minimum(np.floor(events["offset_hours"]), n_hours - 1)
+    if not np.array_equal(events["hour_bin"], expected_bins):
         raise ValueError("hour_bin is inconsistent with offset_hours")
-
-    unknown = sorted(set(events["feature_name"].astype(str)).difference(DYNAMIC_FEATURES))
-    if unknown:
-        raise ValueError(f"Unexpected feature names: {unknown}")
-    expected_sources = events["feature_name"].map(FEATURE_SOURCES)
-    mismatched = events["source_table"].astype(str).ne(expected_sources)
-    if mismatched.any():
-        bad = sorted(events.loc[mismatched, "feature_name"].unique())
-        raise ValueError(f"Feature/source provenance mismatch: {bad}")
-    key_counts = events.groupby("stay_id")[["subject_id", "hadm_id"]].nunique()
-    if key_counts.gt(1).any().any():
-        raise ValueError("One stay_id maps to multiple subject_id or hadm_id values")
-
-
-def _validate_cohort(cohort: pd.DataFrame) -> None:
-    _require_columns(cohort, ("subject_id", "stay_id", "hadm_id", "label"), "Cohort")
-    if cohort.empty:
-        raise ValueError("Cohort is empty")
-    if cohort[["subject_id", "stay_id", "hadm_id", "label"]].isna().any().any():
-        raise ValueError("Cohort contains missing IDs or labels")
-    if cohort["stay_id"].duplicated().any():
-        raise ValueError("Cohort contains duplicate stay_id values")
-    if not set(cohort["label"].unique()).issubset({0, 1}):
-        raise ValueError("Cohort labels must be binary")
-
-
-def _validate_event_cohort_keys(events: pd.DataFrame, cohort: pd.DataFrame) -> None:
-    event_keys = events[["stay_id", "subject_id", "hadm_id"]].drop_duplicates()
-    cohort_keys = cohort[["stay_id", "subject_id", "hadm_id"]]
-    compared = event_keys.merge(
-        cohort_keys,
-        on="stay_id",
-        how="left",
-        suffixes=("_event", "_cohort"),
-        validate="many_to_one",
-    )
-    if compared[["subject_id_cohort", "hadm_id_cohort"]].isna().any().any():
-        raise ValueError("Feature events contain stay_id values outside the cohort")
-    if (
-        compared["subject_id_event"].ne(compared["subject_id_cohort"]).any()
-        or compared["hadm_id_event"].ne(compared["hadm_id_cohort"]).any()
-    ):
-        raise ValueError("Feature-event IDs do not match the cohort")
+    if events["charttime"].isna().any() or not np.isfinite(events["value"]).all():
+        raise ValueError("Events contain missing times or non-finite values")
+    if not events["feature_name"].isin(DYNAMIC_FEATURES).all():
+        raise ValueError("Unexpected feature names")
+    if events["source_table"].ne(events["feature_name"].map(FEATURE_SOURCES)).any():
+        raise ValueError("Feature/source provenance mismatch")
 
 
 def handle_outliers(
@@ -387,7 +281,6 @@ def handle_outliers(
 ) -> pd.DataFrame:
     """Replace values outside fixed clinical/data-quality limits with NaN."""
 
-    _require_columns(events, ("feature_name", "value"), "Feature events")
     cleaned = events.copy()
     for feature_name, (lower, upper) in ranges.items():
         rows = cleaned["feature_name"].eq(feature_name)
@@ -409,101 +302,43 @@ def save_feature_events(events: pd.DataFrame, output_path: Path = FEATURE_EVENTS
     return output_path
 
 
-def _regular_static_features(events: pd.DataFrame) -> pd.DataFrame:
-    names = tuple(
-        name
-        for name in DYNAMIC_FEATURES
-        if name != "urineoutput" and name not in VASOACTIVE_FEATURES
-    )
-    regular = events.loc[events["feature_name"].isin(names)].dropna(subset=["value"]).copy()
-    regular = regular.sort_values(["stay_id", "feature_name", "charttime"], kind="stable")
-    aggregations = (*STATIC_AGGREGATIONS, "count")
-    expected_columns = [f"{name}_{aggregation}" for name in names for aggregation in aggregations]
-    if regular.empty:
-        return pd.DataFrame(columns=expected_columns).rename_axis("stay_id")
-
-    grouped = regular.groupby(["stay_id", "feature_name"], sort=False)["value"].agg(
-        list(aggregations)
-    )
-    frames = []
-    for aggregation in aggregations:
-        pivot = grouped[aggregation].unstack("feature_name").reindex(columns=names)
-        pivot.columns = [f"{name}_{aggregation}" for name in pivot.columns]
-        frames.append(pivot)
-    return pd.concat(frames, axis=1).reindex(columns=expected_columns)
-
-
-def _urine_static_features(events: pd.DataFrame) -> pd.DataFrame:
-    columns = [
-        "urineoutput_min",
-        "urineoutput_max",
-        "urineoutput_mean",
-        "urineoutput_last",
-        "urineoutput_total",
-        "urineoutput_observed_hours",
-        "urineoutput_count",
-    ]
-    urine = events.loc[events["feature_name"].eq("urineoutput")].dropna(subset=["value"])
-    if urine.empty:
-        return pd.DataFrame(columns=columns).rename_axis("stay_id")
-    hourly = (
-        urine.groupby(["stay_id", "hour_bin"], as_index=False, sort=True)
-        .agg(urineoutput=("value", "sum"), urineoutput_count=("value", "size"))
-        .sort_values(["stay_id", "hour_bin"], kind="stable")
-    )
-    static = hourly.groupby("stay_id", sort=False).agg(
-        urineoutput_min=("urineoutput", "min"),
-        urineoutput_max=("urineoutput", "max"),
-        urineoutput_mean=("urineoutput", "mean"),
-        urineoutput_last=("urineoutput", "last"),
-        urineoutput_total=("urineoutput", "sum"),
-        urineoutput_observed_hours=("hour_bin", "nunique"),
-        urineoutput_count=("urineoutput_count", "sum"),
-    )
-    return static.reindex(columns=columns)
-
-
-def _vasoactive_static_features(
+def _hourly_arrays(
     events: pd.DataFrame,
     cohort: pd.DataFrame,
+    feature_names: Sequence[str],
     n_hours: int,
-) -> pd.DataFrame:
-    """Aggregate hourly dose exposure, treating no recorded infusion as zero."""
+) -> tuple[np.ndarray, np.ndarray]:
+    """Aggregate cleaned events in cohort order; mark only recorded cells."""
 
-    aggregations = (*STATIC_AGGREGATIONS, "count")
-    columns = [
-        f"{feature_name}_{aggregation}"
-        for feature_name in VASOACTIVE_FEATURES
-        for aggregation in aggregations
-    ]
-    patient_count = len(cohort)
-    values = np.zeros((patient_count, n_hours, len(VASOACTIVE_FEATURES)), dtype=float)
+    ids = ["stay_id", "subject_id", "hadm_id"]
+    if cohort[ids].isna().any().any() or cohort["stay_id"].duplicated().any():
+        raise ValueError("Cohort IDs must be present and stay_id must be unique")
+    if not cohort["label"].isin([0, 1]).all():
+        raise ValueError("Cohort labels must be binary")
+    event_ids = events[ids].drop_duplicates()
+    if len(event_ids.merge(cohort[ids], on=ids)) != len(event_ids):
+        raise ValueError("Feature-event IDs do not match the cohort")
+
+    selected = events.loc[events["feature_name"].isin(feature_names)].dropna(subset=["value"])
+    summed = selected["feature_name"].isin(("urineoutput", *VASOACTIVE_FEATURES))
+    keys = ["stay_id", "hour_bin", "feature_name"]
+    # Preserve signed urine corrections and sum the SQL's hourly dose contributions.
+    hourly = pd.concat(
+        [
+            selected.loc[~summed].groupby(keys, as_index=False, sort=False)["value"].mean(),
+            selected.loc[summed].groupby(keys, as_index=False, sort=False)["value"].sum(),
+        ],
+        ignore_index=True,
+    )
+    values = np.full((len(cohort), n_hours, len(feature_names)), np.nan, dtype=float)
     observed = np.zeros(values.shape, dtype=np.uint8)
-    selected = events.loc[events["feature_name"].isin(VASOACTIVE_FEATURES)].dropna(subset=["value"])
-    if not selected.empty:
-        hourly = selected.groupby(
-            ["stay_id", "hour_bin", "feature_name"], as_index=False, sort=False
-        )["value"].sum()
-        patient_positions = pd.Series(np.arange(patient_count), index=cohort["stay_id"])
-        feature_positions = {name: index for index, name in enumerate(VASOACTIVE_FEATURES)}
-        patient_index = hourly["stay_id"].map(patient_positions).to_numpy(dtype=np.intp)
-        hour_index = hourly["hour_bin"].to_numpy(dtype=np.intp)
-        feature_index = hourly["feature_name"].map(feature_positions).to_numpy(dtype=np.intp)
-        values[patient_index, hour_index, feature_index] = hourly["value"].to_numpy(float)
-        observed[patient_index, hour_index, feature_index] = 1
-
-    data: dict[str, np.ndarray] = {}
-    for feature_index, feature_name in enumerate(VASOACTIVE_FEATURES):
-        feature_values = values[:, :, feature_index]
-        data[f"{feature_name}_min"] = feature_values.min(axis=1)
-        data[f"{feature_name}_max"] = feature_values.max(axis=1)
-        data[f"{feature_name}_mean"] = feature_values.mean(axis=1)
-        data[f"{feature_name}_last"] = feature_values[:, -1]
-        data[f"{feature_name}_count"] = observed[:, :, feature_index].sum(axis=1)
-    return pd.DataFrame(
-        data,
-        index=pd.Index(cohort["stay_id"].to_numpy(copy=True), name="stay_id"),
-    ).reindex(columns=columns)
+    values[:, :, np.isin(feature_names, VASOACTIVE_FEATURES)] = 0.0
+    patient_index = pd.Index(cohort["stay_id"]).get_indexer(hourly["stay_id"])
+    hour_index = hourly["hour_bin"].to_numpy(dtype=int)
+    feature_index = pd.Index(feature_names).get_indexer(hourly["feature_name"])
+    values[patient_index, hour_index, feature_index] = hourly["value"].to_numpy(float)
+    observed[patient_index, hour_index, feature_index] = 1
+    return values, observed
 
 
 def build_static_features(
@@ -516,43 +351,67 @@ def build_static_features(
     """Build one leakage-safe, unscaled static row per cohort stay."""
 
     validate_feature_events(events, n_hours)
-    _validate_cohort(cohort)
-    _validate_event_cohort_keys(events, cohort)
-    cleaned = handle_outliers(events, ranges)
-    regular = _regular_static_features(cleaned)
-    urine = _urine_static_features(cleaned)
-    vasoactive = _vasoactive_static_features(cleaned, cohort, n_hours)
+    cleaned = handle_outliers(events, ranges).dropna(subset=["value"])
+
+    # Vitals and labs: min/max/mean/last, plus the number of source records.
+    names = [
+        name for name in DYNAMIC_FEATURES
+        if name != "urineoutput" and name not in VASOACTIVE_FEATURES
+    ]
+    regular = cleaned.loc[cleaned["feature_name"].isin(names)]
+    regular = regular.sort_values(["stay_id", "feature_name", "charttime"], kind="stable")
+    aggregations = [*STATIC_AGGREGATIONS, "count"]
+    regular = regular.groupby(["stay_id", "feature_name"])["value"].agg(aggregations)
+    regular = regular.unstack("feature_name")
+    regular.columns = [f"{name}_{aggregation}" for aggregation, name in regular.columns]
+    regular = regular.reindex(columns=[f"{name}_{agg}" for name in names for agg in aggregations])
+
+    # Urine: sum source records per hour before calculating static statistics.
+    urine = cleaned.loc[cleaned["feature_name"].eq("urineoutput")]
+    urine = urine.groupby(["stay_id", "hour_bin"], as_index=False, sort=True).agg(
+        volume=("value", "sum"), records=("value", "size")
+    )
+    urine = urine.groupby("stay_id").agg(
+        urineoutput_min=("volume", "min"),
+        urineoutput_max=("volume", "max"),
+        urineoutput_mean=("volume", "mean"),
+        urineoutput_last=("volume", "last"),
+        urineoutput_total=("volume", "sum"),
+        urineoutput_observed_hours=("hour_bin", "nunique"),
+        urineoutput_count=("records", "sum"),
+    )
+
     context_columns = [column for column in SAFE_CONTEXT_COLUMNS if column in cohort.columns]
     static = cohort.loc[:, context_columns].copy()
-    static = static.merge(regular.reset_index(), on="stay_id", how="left", validate="one_to_one")
-    static = static.merge(urine.reset_index(), on="stay_id", how="left", validate="one_to_one")
-    static = static.merge(vasoactive.reset_index(), on="stay_id", how="left", validate="one_to_one")
+    static = static.merge(regular, on="stay_id", how="left")
+    static = static.merge(urine, on="stay_id", how="left")
+
+    # Drugs: include zero for every hour with no documented infusion.
+    values, observed = _hourly_arrays(cleaned, cohort, VASOACTIVE_FEATURES, n_hours)
+    for feature_index, name in enumerate(VASOACTIVE_FEATURES):
+        doses = values[:, :, feature_index]
+        static[f"{name}_min"] = doses.min(axis=1)
+        static[f"{name}_max"] = doses.max(axis=1)
+        static[f"{name}_mean"] = doses.mean(axis=1)
+        static[f"{name}_last"] = doses[:, -1]
+        static[f"{name}_count"] = observed[:, :, feature_index].sum(axis=1)
+
     count_columns = [column for column in static if column.endswith("_count")]
-    if "urineoutput_observed_hours" in static:
-        count_columns.append("urineoutput_observed_hours")
+    count_columns.append("urineoutput_observed_hours")
     static[count_columns] = static[count_columns].fillna(0).astype("int64")
-    validate_static_features(static, cohort)
     return static
 
 
 def validate_static_features(static: pd.DataFrame, cohort: pd.DataFrame) -> None:
     """Validate identity, order, and leakage constraints of a static matrix."""
 
-    _validate_cohort(cohort)
-    _require_columns(static, ("subject_id", "stay_id", "hadm_id", "label"), "Static features")
-    if static.empty or len(static) != len(cohort):
-        raise ValueError("Static feature matrix is not aligned with the cohort")
-    if static["stay_id"].duplicated().any():
-        raise ValueError("Static feature matrix contains duplicate stay_id values")
-    if (
-        not static["stay_id"]
-        .reset_index(drop=True)
-        .equals(cohort["stay_id"].reset_index(drop=True))
-    ):
-        raise ValueError("Static feature order differs from the cohort")
-    forbidden = sorted(FORBIDDEN_FEATURE_COLUMNS.intersection(static.columns))
-    if forbidden:
-        raise ValueError(f"Static features contain forbidden future columns: {forbidden}")
+    keys = ["subject_id", "stay_id", "hadm_id", "label"]
+    if not static[keys].reset_index(drop=True).equals(cohort[keys].reset_index(drop=True)):
+        raise ValueError("Static features and cohort IDs/labels are not aligned")
+    if static["stay_id"].duplicated().any() or not static["label"].isin([0, 1]).all():
+        raise ValueError("Static features have duplicate stays or invalid labels")
+    if FORBIDDEN_FEATURE_COLUMNS.intersection(static.columns):
+        raise ValueError("Static features contain future information")
 
 
 def save_static_features(
@@ -580,59 +439,11 @@ def build_hourly_features(
     """Build unscaled hourly values and the pre-imputation observation mask."""
 
     validate_feature_events(events, n_hours)
-    _validate_cohort(cohort)
-    _validate_event_cohort_keys(events, cohort)
-    if len(set(feature_names)) != len(feature_names):
-        raise ValueError("feature_names contains duplicates")
-    unknown = sorted(set(feature_names).difference(DYNAMIC_FEATURES))
-    if unknown:
-        raise ValueError(f"Unknown hourly features: {unknown}")
 
-    selected = handle_outliers(events, ranges)
-    selected = selected.loc[selected["feature_name"].isin(feature_names)].dropna(subset=["value"])
-    regular = selected.loc[
-        selected["feature_name"].ne("urineoutput")
-        & ~selected["feature_name"].isin(VASOACTIVE_FEATURES)
-    ]
-    urine = selected.loc[selected["feature_name"].eq("urineoutput")]
-    vasoactive = selected.loc[selected["feature_name"].isin(VASOACTIVE_FEATURES)]
-    parts = []
-    if not regular.empty:
-        parts.append(
-            regular.groupby(["stay_id", "hour_bin", "feature_name"], as_index=False, sort=False)[
-                "value"
-            ].mean()
-        )
-    if not urine.empty:
-        # MIT-LCP encodes GU irrigant input as negative urineoutput. Preserve
-        # the sign so that summing produces the intended net hourly volume.
-        urine_hourly = urine.groupby(
-            ["stay_id", "hour_bin", "feature_name"], as_index=False, sort=False
-        )["value"].sum()
-        parts.append(urine_hourly)
-    if not vasoactive.empty:
-        parts.append(
-            vasoactive.groupby(["stay_id", "hour_bin", "feature_name"], as_index=False, sort=False)[
-                "value"
-            ].sum()
-        )
-
-    patient_count = len(cohort)
-    values = np.full((patient_count, n_hours, len(feature_names)), np.nan, dtype=np.float32)
-    mask = np.zeros(values.shape, dtype=np.uint8)
-    for feature_index, feature_name in enumerate(feature_names):
-        if feature_name in VASOACTIVE_FEATURES:
-            values[:, :, feature_index] = 0.0
-            mask[:, :, feature_index] = 1
-    if parts:
-        hourly = pd.concat(parts, ignore_index=True)
-        patient_positions = pd.Series(np.arange(patient_count), index=cohort["stay_id"])
-        feature_positions = {name: index for index, name in enumerate(feature_names)}
-        patient_index = hourly["stay_id"].map(patient_positions).to_numpy(dtype=np.intp)
-        hour_index = hourly["hour_bin"].to_numpy(dtype=np.intp)
-        feature_index = hourly["feature_name"].map(feature_positions).to_numpy(dtype=np.intp)
-        values[patient_index, hour_index, feature_index] = hourly["value"].to_numpy(np.float32)
-        mask[patient_index, hour_index, feature_index] = 1
+    cleaned = handle_outliers(events, ranges)
+    values, mask = _hourly_arrays(cleaned, cohort, feature_names, n_hours)
+    values = values.astype(np.float32)
+    mask[:, :, np.isin(feature_names, VASOACTIVE_FEATURES)] = 1
 
     if forward_fill:
         for feature_index, feature_name in enumerate(feature_names):
@@ -641,7 +452,7 @@ def build_hourly_features(
                     pd.DataFrame(values[:, :, feature_index]).ffill(axis=1).to_numpy(np.float32)
                 )
 
-    result = HourlyFeatures(
+    return HourlyFeatures(
         values=values,
         mask=mask,
         subject_ids=cohort["subject_id"].to_numpy(copy=True),
@@ -650,40 +461,23 @@ def build_hourly_features(
         labels=cohort["label"].to_numpy(dtype=np.int8, copy=True),
         feature_names=tuple(feature_names),
     )
-    validate_hourly_features(result, n_hours)
-    return result
 
 
 def validate_hourly_features(hourly: HourlyFeatures, n_hours: int = N_HOURS) -> None:
-    """Validate tensor shapes, IDs, mask values, and numeric contents."""
+    """Check array alignment, labels, and the observation mask before saving."""
 
-    if hourly.values.ndim != 3 or hourly.mask.ndim != 3:
-        raise ValueError("Hourly values and mask must both be three-dimensional")
-    if hourly.values.shape != hourly.mask.shape:
-        raise ValueError("Hourly values and mask shapes differ")
-    patient_count, hour_count, variable_count = hourly.values.shape
-    if hour_count != n_hours:
-        raise ValueError(f"Expected {n_hours} hourly bins, received {hour_count}")
-    if variable_count != len(hourly.feature_names):
-        raise ValueError("Feature-name count does not match the hourly tensor")
-    if len(set(hourly.feature_names)) != len(hourly.feature_names):
-        raise ValueError("Hourly feature names contain duplicates")
-    for name, array in (
-        ("subject_ids", hourly.subject_ids),
-        ("stay_ids", hourly.stay_ids),
-        ("hadm_ids", hourly.hadm_ids),
-        ("labels", hourly.labels),
-    ):
-        if len(array) != patient_count:
-            raise ValueError(f"{name} is not aligned with the hourly tensor")
-    if not np.isin(hourly.mask, (0, 1)).all():
-        raise ValueError("Hourly mask must be binary")
-    if np.isinf(hourly.values).any():
-        raise ValueError("Hourly values contain infinity")
-    if np.isnan(hourly.values[hourly.mask.astype(bool)]).any():
-        raise ValueError("Observed hourly cells cannot be NaN")
+    shape = (len(hourly.labels), n_hours, len(hourly.feature_names))
+    if hourly.values.shape != shape or hourly.mask.shape != shape:
+        raise ValueError("Hourly values and mask are not aligned")
+    for ids in (hourly.subject_ids, hourly.stay_ids, hourly.hadm_ids):
+        if len(ids) != len(hourly.labels):
+            raise ValueError("Hourly IDs are not aligned with labels")
     if not np.isin(hourly.labels, (0, 1)).all():
         raise ValueError("Hourly labels must be binary")
+    if not np.isin(hourly.mask, (0, 1)).all():
+        raise ValueError("Hourly mask must be binary")
+    if not np.isfinite(hourly.values[hourly.mask == 1]).all():
+        raise ValueError("Observed hourly cells must have finite values")
 
 
 def save_hourly_features(
@@ -714,14 +508,9 @@ def fit_feature_medians(train_values: np.ndarray) -> np.ndarray:
     """Fit per-feature medians on a training split only."""
 
     values = np.asarray(train_values, dtype=float)
-    if values.ndim not in (2, 3):
-        raise ValueError("train_values must be a 2D or 3D array")
     flat = values.reshape(-1, values.shape[-1])
-    missing = np.isnan(flat).all(axis=0)
-    if missing.any():
-        raise ValueError(
-            f"Training features entirely missing at indexes: {np.flatnonzero(missing).tolist()}"
-        )
+    if np.isnan(flat).all(axis=0).any():
+        raise ValueError("Some training features are entirely missing")
     return np.nanmedian(flat, axis=0)
 
 
@@ -729,34 +518,20 @@ def apply_feature_medians(values: np.ndarray, medians: np.ndarray) -> np.ndarray
     """Apply training-derived medians without changing array shape."""
 
     array = np.asarray(values, dtype=float)
-    medians = np.asarray(medians, dtype=float)
-    if array.ndim not in (2, 3) or medians.shape != (array.shape[-1],):
-        raise ValueError("Median vector does not match the feature dimension")
-    shape = (1,) * (array.ndim - 1) + (array.shape[-1],)
-    return np.where(np.isnan(array), medians.reshape(shape), array)
+    return np.where(np.isnan(array), medians, array)
 
 
 def fit_scaler(train_values: np.ndarray) -> StandardScaler:
     """Fit a z-score scaler on finite training values only."""
 
     values = np.asarray(train_values, dtype=float)
-    if values.ndim not in (2, 3):
-        raise ValueError("train_values must be a 2D or 3D array")
-    if not np.isfinite(values).all():
-        raise ValueError("Impute missing values before fitting the scaler")
-    scaler = StandardScaler()
-    scaler.fit(values.reshape(-1, values.shape[-1]))
-    return scaler
+    return StandardScaler().fit(values.reshape(-1, values.shape[-1]))
 
 
 def apply_scaler(values: np.ndarray, scaler: StandardScaler) -> np.ndarray:
     """Apply a training-fitted scaler to a 2D or 3D array."""
 
     array = np.asarray(values, dtype=float)
-    if array.ndim not in (2, 3) or not np.isfinite(array).all():
-        raise ValueError("values must be a finite 2D or 3D array")
-    if getattr(scaler, "n_features_in_", None) != array.shape[-1]:
-        raise ValueError("Scaler does not match the feature dimension")
     shape = array.shape
     return scaler.transform(array.reshape(-1, shape[-1])).reshape(shape)
 
@@ -770,9 +545,6 @@ def build_feature_dictionary(
 ) -> pd.DataFrame:
     """Create an aggregate variable dictionary and coverage table."""
 
-    validate_feature_events(events, n_hours)
-    _validate_cohort(cohort)
-    _validate_event_cohort_keys(events, cohort)
     cleaned = handle_outliers(events, ranges).dropna(subset=["value"])
     rows = []
     for feature_name in DYNAMIC_FEATURES:
@@ -822,8 +594,6 @@ def build_summary_statistics(static: pd.DataFrame) -> pd.DataFrame:
         for column in static.select_dtypes(include=[np.number]).columns
         if column not in excluded
     ]
-    if not columns:
-        raise ValueError("Static matrix has no numeric feature columns")
     summary = static[columns].describe(percentiles=[0.25, 0.5, 0.75]).T
     summary["missing_rate"] = static[columns].isna().mean()
     return summary.reset_index(names="feature_name")
@@ -843,9 +613,7 @@ def run_stage2(
     """Run Stage 2 inside the protected credentialed environment."""
 
     cohort = pd.read_parquet(cohort_path)
-    _validate_cohort(cohort)
     events = load_feature_events(client, source_project)
-    validate_feature_events(events)
     save_feature_events(events, events_path)
     static = build_static_features(events, cohort)
     save_static_features(static, cohort, static_path)

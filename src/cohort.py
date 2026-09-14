@@ -39,24 +39,6 @@ if TYPE_CHECKING:
 COHORT_SQL_FILE = SQL_DIR / "cohort_mimiciv.sql"
 CONSORT_SQL_FILE = SQL_DIR / "consort_mimiciv.sql"
 
-FINAL_COLUMNS = [
-    "subject_id",
-    "stay_id",
-    "hadm_id",
-    "intime",
-    "outtime",
-    "feature_window_end",
-    "prediction_window_end",
-    "age",
-    "gender",
-    "race",
-    "los_hours",
-    "sepsis_onset_time",
-    "onset_offset_h",
-    "label",
-]
-
-
 @dataclass(frozen=True)
 class Stage1Artifacts:
     """Paths and safe aggregate outputs created by :func:`run_stage1`."""
@@ -67,25 +49,12 @@ class Stage1Artifacts:
     counts: pd.DataFrame
 
 
-def _require_columns(frame: pd.DataFrame, required: set[str]) -> None:
-    missing = sorted(required.difference(frame.columns))
-    if missing:
-        raise ValueError(f"Missing required cohort columns: {', '.join(missing)}")
-
-
-def _validate_project_id(project_id: str) -> str:
-    """Validate a Google Cloud project id before inserting it into SQL."""
-
-    if not re.fullmatch(r"[a-z][a-z0-9-]{4,28}[a-z0-9]", project_id):
-        raise ValueError(f"Invalid Google Cloud project id: {project_id!r}")
-    return project_id
-
-
 def render_stage1_sql(path: Path, source_project: str = SOURCE_PROJECT) -> str:
     """Load a Stage-1 SQL template and safely fill its source project id."""
 
-    project = _validate_project_id(source_project)
-    return path.read_text(encoding="utf-8").replace("{{SOURCE_PROJECT}}", project)
+    if not re.fullmatch(r"[a-z][a-z0-9-]{4,28}[a-z0-9]", source_project):
+        raise ValueError(f"Invalid Google Cloud project id: {source_project!r}")
+    return path.read_text(encoding="utf-8").replace("{{SOURCE_PROJECT}}", source_project)
 
 
 def build_query_job_config(
@@ -95,9 +64,6 @@ def build_query_job_config(
     first_icu_stay_only: bool = FIRST_ICU_STAY_ONLY,
 ) -> "bigquery.QueryJobConfig":
     """Build the shared, parameterized BigQuery configuration."""
-
-    if n_hours <= 0 or m_hours <= 0:
-        raise ValueError("n_hours and m_hours must both be positive")
 
     from google.cloud import bigquery
 
@@ -158,50 +124,35 @@ def validate_cohort(
     age_min: int = AGE_MIN,
     first_icu_stay_only: bool = FIRST_ICU_STAY_ONLY,
 ) -> None:
-    """Raise ``ValueError`` when a final cohort violates any locked rule."""
+    """Check patient grouping and the positive/negative observation windows."""
 
-    _require_columns(cohort, set(FINAL_COLUMNS))
-    upper = n_hours + m_hours
-
-    failures: list[str] = []
     if cohort["stay_id"].duplicated().any():
-        failures.append("stay_id is not unique")
+        raise ValueError("stay_id is not unique")
     if first_icu_stay_only and cohort["subject_id"].duplicated().any():
-        failures.append("subject_id is not unique although first-stay-only is locked")
-    if not set(cohort["label"].dropna().unique()).issubset({0, 1}):
-        failures.append("label contains values other than 0/1")
-    if cohort["label"].isna().any():
-        failures.append("final cohort contains missing labels")
-    if cohort["age"].lt(age_min).any():
-        failures.append("final cohort contains underage patients")
-    known_onsets = cohort["onset_offset_h"].dropna()
-    if known_onsets.le(n_hours).any():
-        failures.append(f"onset at or before hour {n_hours} leaked into the cohort")
+        raise ValueError("subject_id is not unique although first-stay-only is selected")
+    if not cohort["label"].isin([0, 1]).all():
+        raise ValueError("Cohort labels must be binary")
+    if not cohort["age"].ge(age_min).all():
+        raise ValueError("Cohort contains underage or missing-age patients")
 
-    positive = cohort["label"].eq(1)
-    negative = cohort["label"].eq(0)
-    if (
-        ~cohort.loc[positive, "onset_offset_h"].gt(n_hours)
-        | ~cohort.loc[positive, "onset_offset_h"].le(upper)
-        | ~cohort.loc[positive, "los_hours"].ge(n_hours)
-    ).any():
-        failures.append("one or more positive rows violate the onset/stay window")
-    negative_offsets = cohort.loc[negative, "onset_offset_h"]
-    if (
-        cohort.loc[negative, "los_hours"].lt(upper).any()
-        or (~(negative_offsets.isna() | negative_offsets.gt(upper))).any()
-    ):
-        failures.append("one or more negative rows violate follow-up/onset rules")
-
-    if failures:
-        raise ValueError("Invalid cohort: " + "; ".join(failures))
+    upper = n_hours + m_hours
+    positive = cohort.loc[cohort["label"].eq(1)]
+    positive_valid = (
+        positive["onset_offset_h"].between(n_hours, upper, inclusive="right")
+        & positive["los_hours"].ge(n_hours)
+    )
+    negative = cohort.loc[cohort["label"].eq(0)]
+    negative_valid = (
+        (negative["onset_offset_h"].isna() | negative["onset_offset_h"].gt(upper))
+        & negative["los_hours"].ge(upper)
+    )
+    if not positive_valid.all() or not negative_valid.all():
+        raise ValueError("Cohort violates the onset or follow-up window")
 
 
 def plot_consort(counts: pd.DataFrame, output_path: Path) -> Path:
     """Render a compact CONSORT-style flow diagram from aggregate counts."""
 
-    required = {"stage_code", "stage_label", "stay_count", "subject_count"}
-    _require_columns(counts, required)
     lookup = counts.set_index("stage_code")
     main_codes = [
         "all_icu_stays",

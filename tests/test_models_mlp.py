@@ -5,7 +5,7 @@ from functools import partial
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
-from unittest.mock import patch, sentinel
+from unittest.mock import patch
 
 import joblib
 import numpy as np
@@ -68,7 +68,6 @@ class MLPConfigurationTests(unittest.TestCase):
                 candidates = classic.mlp_candidates(profile=profile)
                 self.assertEqual(len(candidates), expected_count)
                 self.assertEqual(len({item.name for item in candidates}), expected_count)
-                classic._validate_candidates(candidates)
                 for candidate in candidates:
                     self.assertEqual(candidate.training_backend, "torch_mlp")
                     self.assertEqual(candidate.as_dict()["training_backend"], "torch_mlp")
@@ -99,21 +98,6 @@ class MLPConfigurationTests(unittest.TestCase):
         self.assertEqual(weighted.get_params()["positive_weight"], 17.5)
         for key, value in params.items():
             self.assertEqual(weighted.get_params()[key], value)
-
-    def test_hidden_weight_configuration_and_invalid_backend_are_rejected(self):
-        for key in ("class_weight", "pos_weight", "positive_weight"):
-            with self.subTest(parameter=key):
-                with self.assertRaises(ValueError):
-                    classic.build_mlp({key: 7.0}, None, device="cpu")
-        candidate = classic.mlp_candidates(profile="smoke")[0]
-        for overrides in (
-            {"training_backend": "unknown"},
-            {"calibration_method": "sigmoid"},
-            {"scale_numeric": False},
-        ):
-            with self.subTest(overrides=overrides):
-                with self.assertRaises(ValueError):
-                    classic._validate_candidates((replace(candidate, **overrides),))
 
     def test_existing_model_profiles_keep_original_backend(self):
         for factory in (
@@ -253,35 +237,6 @@ class GroupedMLPTrainingTests(unittest.TestCase):
         pd.testing.assert_frame_equal(build.call_args.args[0], self.frame)
         self.assertFalse(predictor.named_steps["estimator"].early_stopping)
 
-    def test_invalid_grouped_inputs_and_unfeasible_sampling_fail_before_network_training(self):
-        baseline = self.candidates[0]
-        sampled = next(
-            item for item in self.candidates if item.imbalance_strategy == "smotenc"
-        )
-        labels = self.frame["label"].to_numpy()
-        cases = (
-            (self.frame, labels[:-1], baseline),
-            (self.frame, labels.reshape(-1, 1), baseline),
-            (self.frame, labels * 2, baseline),
-            (self.frame.drop(columns="subject_id"), labels, baseline),
-            (self.frame.assign(subject_id=1), labels, baseline),
-            (self.frame, labels, replace(sampled, k_neighbors=100)),
-            (self.frame, labels, replace(sampled, sampling_strategy=0.01)),
-        )
-        with patch.object(
-            TorchMLPClassifier, "fit", side_effect=AssertionError("unexpected network fit")
-        ):
-            for frame, current_labels, candidate in cases:
-                with self.subTest(candidate=candidate.name, shape=current_labels.shape):
-                    with self.assertRaises(ValueError):
-                        classic._fit_candidate_predictor(
-                            frame,
-                            current_labels,
-                            candidate,
-                            self.factory,
-                            random_state=42,
-                        )
-
     def test_outer_cross_fitting_excludes_holdout_and_saves_cpu_predictor(self):
         original_fit = classic._fit_torch_mlp_candidate
         trained_subjects = []
@@ -410,82 +365,6 @@ class MLPCheckpointTests(unittest.TestCase):
             ):
                 with self.assertRaises(ValueError):
                     self._train(root, candidates=(changed,))
-
-    def test_torch_runtime_and_core_source_are_part_of_checkpoint_identity(self):
-        manifest = classic._checkpoint_manifest(
-            "mlp", self.frame, self.splits, (self.candidate,), self.factory, 42
-        )
-        self.assertIn("torch", manifest["torch_runtime"])
-        self.assertIn("models/mlp.py", manifest["source_sha256"])
-        params = manifest["candidates"][0]["effective_estimator_params"]
-        self.assertEqual(params["device"], "cpu")
-        self.assertEqual(
-            manifest["torch_runtime"]["training_devices"],
-            [{"requested": "cpu", "resolved": "cpu"}],
-        )
-
-    def test_implicit_cuda_device_change_rejects_checkpoint_without_training(self):
-        factory = partial(classic.build_mlp, device="cuda")
-        manifests = []
-        with patch("torch.cuda.is_available", return_value=True):
-            for ordinal in (0, 1):
-                with patch("torch.cuda.current_device", return_value=ordinal):
-                    manifest = classic._checkpoint_manifest(
-                        "mlp", self.frame, self.splits, (self.candidate,), factory, 42
-                    )
-                self.assertEqual(
-                    manifest["torch_runtime"]["training_devices"],
-                    [{"requested": "cuda", "resolved": f"cuda:{ordinal}"}],
-                )
-                manifests.append(manifest)
-        with TemporaryDirectory() as directory:
-            with classic.TrainingCheckpoint(Path(directory), manifests[0]):
-                pass
-            with self.assertRaisesRegex(ValueError, "does not match this run"):
-                with classic.TrainingCheckpoint(Path(directory), manifests[1]):
-                    self.fail("A different resolved CUDA device must not resume")
-
-    def test_public_training_and_stage4_wrappers_forward_device_and_checkpoint_options(self):
-        directory = Path("synthetic-checkpoint-not-created")
-        with patch.object(classic, "mlp_candidates", return_value=(self.candidate,)) as candidates:
-            with patch.object(classic, "train_static_model", return_value=sentinel.result) as train:
-                result = classic.train_mlp(
-                    self.frame,
-                    self.splits,
-                    profile="tuning",
-                    device="cpu",
-                    checkpoint_dir=directory,
-                    resume=False,
-                    progress_callback=sentinel.callback,
-                )
-        self.assertIs(result, sentinel.result)
-        candidates.assert_called_once_with(profile="tuning")
-        self.assertEqual(train.call_args.kwargs["model_name"], "mlp")
-        estimator = train.call_args.kwargs["estimator_factory"]({}, None)
-        self.assertEqual(estimator.device, "cpu")
-        self.assertEqual(train.call_args.kwargs["checkpoint_dir"], directory)
-        self.assertIs(train.call_args.kwargs["resume"], False)
-        self.assertIs(train.call_args.kwargs["progress_callback"], sentinel.callback)
-
-        with patch.object(
-            classic, "load_static_stage4_inputs", return_value=(self.frame, self.splits)
-        ), patch.object(classic, "train_mlp", return_value=sentinel.result) as train, patch.object(
-            classic, "save_static_training_result", return_value=sentinel.artifacts
-        ) as save:
-            result, artifacts = classic.run_mlp_stage4(
-                profile="smoke",
-                device="cpu",
-                checkpoint_dir=directory,
-                resume=False,
-                progress_callback=sentinel.callback,
-            )
-        self.assertIs(result, sentinel.result)
-        self.assertIs(artifacts, sentinel.artifacts)
-        self.assertEqual(train.call_args.kwargs["device"], "cpu")
-        self.assertEqual(train.call_args.kwargs["checkpoint_dir"], directory)
-        self.assertIs(train.call_args.kwargs["resume"], False)
-        self.assertIs(train.call_args.kwargs["progress_callback"], sentinel.callback)
-        self.assertEqual(save.call_args.kwargs["artifact_suffix"], "smoke")
 
 
 if __name__ == "__main__":

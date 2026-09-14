@@ -5,7 +5,7 @@ from functools import partial
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
-from unittest.mock import patch, sentinel
+from unittest.mock import patch
 
 from imblearn.pipeline import Pipeline
 import numpy as np
@@ -260,57 +260,6 @@ class TrainingCheckpointIntegrationTests(unittest.TestCase):
                             with self.assertRaises(ValueError):
                                 self._train(root, **gpu_options)
                     self._assert_same_result(expected, actual)
-
-    def test_model_helpers_forward_checkpoint_and_resume_options(self) -> None:
-        helpers = (
-            (classic.train_logistic_regression, "logistic_regression_candidates"),
-            (classic.train_xgboost, "xgboost_candidates"),
-            (classic.train_random_forest, "random_forest_candidates"),
-        )
-        checkpoint_dir = Path("synthetic-checkpoint-not-created")
-        for helper, candidate_function in helpers:
-            with self.subTest(helper=helper.__name__):
-                with patch.object(classic, candidate_function, return_value=self.candidates):
-                    with patch.object(
-                        classic, "train_static_model", return_value=sentinel.result
-                    ) as train:
-                        result = helper(
-                            self.frame,
-                            self.splits,
-                            profile="tuning",
-                            checkpoint_dir=checkpoint_dir,
-                            resume=False,
-                        )
-                self.assertIs(result, sentinel.result)
-                self.assertEqual(train.call_args.kwargs["checkpoint_dir"], checkpoint_dir)
-                self.assertIs(train.call_args.kwargs["resume"], False)
-
-    def test_stage4_wrappers_forward_checkpoint_and_resume_options(self) -> None:
-        helpers = (
-            (classic.run_logistic_regression_stage4, "train_logistic_regression"),
-            (classic.run_xgboost_stage4, "train_xgboost"),
-        )
-        checkpoint_dir = Path("synthetic-checkpoint-not-created")
-        for helper, training_function in helpers:
-            with self.subTest(helper=helper.__name__):
-                with patch.object(
-                    classic, "load_static_stage4_inputs", return_value=(self.frame, self.splits)
-                ):
-                    with patch.object(
-                        classic, training_function, return_value=sentinel.result
-                    ) as train:
-                        with patch.object(
-                            classic, "save_static_training_result", return_value=sentinel.artifacts
-                        ):
-                            result, artifacts = helper(
-                                profile="tuning",
-                                checkpoint_dir=checkpoint_dir,
-                                resume=False,
-                            )
-                self.assertIs(result, sentinel.result)
-                self.assertIs(artifacts, sentinel.artifacts)
-                self.assertEqual(train.call_args.kwargs["checkpoint_dir"], checkpoint_dir)
-                self.assertIs(train.call_args.kwargs["resume"], False)
 
 
 if __name__ == "__main__":

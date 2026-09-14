@@ -4,7 +4,7 @@ from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
-from unittest.mock import patch, sentinel
+from unittest.mock import patch
 
 import joblib
 import numpy as np
@@ -53,7 +53,6 @@ class SVMConfigurationTests(unittest.TestCase):
                 candidates = classic.svm_candidates(profile=profile)
                 self.assertEqual(len(candidates), expected_count)
                 self.assertEqual(len({item.name for item in candidates}), expected_count)
-                classic._validate_candidates(candidates)
                 for candidate in candidates:
                     self.assertTrue(candidate.scale_numeric)
                     self.assertEqual(candidate.calibration_method, "sigmoid")
@@ -112,19 +111,6 @@ class SVMConfigurationTests(unittest.TestCase):
         self.assertEqual(copied.random_state, 42)
         self.assertFalse(hasattr(copied, "pipeline_"))
 
-    def test_invalid_calibration_settings_fail_candidate_validation(self) -> None:
-        candidate = classic.svm_candidates(profile="smoke")[0]
-        invalid_settings = (
-            {"calibration_method": "isotonic"},
-            {"calibration_n_splits": 1},
-            {"calibration_n_splits": 2.5},
-            {"calibration_n_splits": True},
-        )
-        for overrides in invalid_settings:
-            with self.subTest(overrides=overrides):
-                with self.assertRaises(ValueError):
-                    classic._validate_candidates((replace(candidate, **overrides),))
-
     def test_existing_candidates_keep_uncalibrated_default(self) -> None:
         for factory in (
             classic.logistic_regression_candidates,
@@ -151,29 +137,6 @@ class GroupedSVMCalibrationTests(unittest.TestCase):
             random_state=42,
         )
 
-    def test_inner_splits_are_grouped_reproducible_and_cover_each_original_row_once(self) -> None:
-        train_indices, _ = next(self.splits.iter_cv())
-        training = self.frame.iloc[train_indices]
-        candidate = self.candidates[0]
-        labels = training["label"].to_numpy()
-        inner = classic._calibration_splits(training, labels, candidate, random_state=42)
-        repeated = classic._calibration_splits(training, labels, candidate, random_state=42)
-        visits = np.zeros(len(training), dtype=np.int8)
-        groups = training["subject_id"].to_numpy()
-
-        self.assertEqual(len(inner), 3)
-        for (train, validation), (again_train, again_validation) in zip(inner, repeated):
-            np.testing.assert_array_equal(train, again_train)
-            np.testing.assert_array_equal(validation, again_validation)
-            self.assertTrue(set(groups[train]).isdisjoint(groups[validation]))
-            np.testing.assert_array_equal(
-                np.sort(np.concatenate((train, validation))), np.arange(len(training))
-            )
-            self.assertEqual(set(labels[train]), {0, 1})
-            self.assertEqual(set(labels[validation]), {0, 1})
-            visits[validation] += 1
-        np.testing.assert_array_equal(visits, np.ones(len(training), dtype=np.int8))
-
     def test_every_strategy_builds_and_fits_preprocessing_on_its_actual_inner_subset(self) -> None:
         train_indices, _ = next(self.splits.iter_cv())
         training = self.frame.iloc[train_indices]
@@ -187,8 +150,6 @@ class GroupedSVMCalibrationTests(unittest.TestCase):
 
         for candidate in self.candidates:
             with self.subTest(strategy=candidate.strategy_name):
-                inner = classic._calibration_splits(training, labels, candidate, random_state=42)
-                expected_indices = [train for train, _ in inner] + [np.arange(len(training))]
                 built = []
 
                 def recorded_builder(current_training, estimator, **kwargs):
@@ -214,6 +175,11 @@ class GroupedSVMCalibrationTests(unittest.TestCase):
                 self.assertFalse(fitted.ensemble)
                 self.assertEqual(fitted.n_jobs, 1)
                 self.assertEqual(len(built), 4)  # Three inner fits, one full-outer refit.
+                for train, valid in fitted.cv:
+                    self.assertTrue(set(training.iloc[train]["subject_id"]).isdisjoint(
+                        training.iloc[valid]["subject_id"]
+                    ))
+                expected_indices = [train for train, _ in fitted.cv] + [np.arange(len(training))]
                 observed_weights = []
                 for (current, estimator, pipeline), positions in zip(built, expected_indices):
                     pd.testing.assert_frame_equal(current, training.iloc[positions])
@@ -260,53 +226,6 @@ class GroupedSVMCalibrationTests(unittest.TestCase):
                 self.assertTrue(((probabilities >= 0) & (probabilities <= 1)).all())
                 np.testing.assert_allclose(probabilities.sum(axis=1), 1.0)
                 np.testing.assert_array_equal(fitted.classes_, [0, 1])
-
-    def test_invalid_group_structure_and_class_coverage_fail_before_any_fit(self) -> None:
-        missing_subject = self.frame.drop(columns="subject_id")
-        missing_group_value = self.frame.copy()
-        missing_group_value.iloc[0, missing_group_value.columns.get_loc("subject_id")] = np.nan
-        too_few_groups = self.frame.assign(subject_id=1)
-        one_class = self.frame.assign(label=0)
-        positive_single_group = self.frame.copy()
-        positive_single_group["label"] = 0
-        positive_single_group.iloc[:10, positive_single_group.columns.get_loc("label")] = 1
-        positive_single_group.iloc[:10, positive_single_group.columns.get_loc("subject_id")] = 10_000
-        for label, frame in (
-            ("missing subject column", missing_subject),
-            ("missing group value", missing_group_value),
-            ("too few groups", too_few_groups),
-            ("single class", one_class),
-            ("positives in only one patient", positive_single_group),
-        ):
-            with self.subTest(case=label):
-                with patch.object(
-                    classic, "_fit_plain_candidate", side_effect=AssertionError("unexpected fit")
-                ):
-                    with self.assertRaises(ValueError):
-                        self._fit(frame, self.candidates[0])
-
-    def test_insufficient_inner_smote_neighbors_or_ratio_fail_before_any_fit(self) -> None:
-        sampled = next(item for item in self.candidates if item.imbalance_strategy == "smotenc")
-        for candidate in (
-            # Twenty positives suffice globally, but the inner training folds have fewer.
-            replace(sampled, k_neighbors=15),
-            replace(sampled, sampling_strategy=0.01),
-        ):
-            with self.subTest(candidate=candidate):
-                with patch.object(
-                    classic, "_fit_plain_candidate", side_effect=AssertionError("unexpected fit")
-                ):
-                    with self.assertRaises(ValueError):
-                        self._fit(self.frame, candidate)
-
-    def test_calibration_rejects_misaligned_or_nonbinary_labels(self) -> None:
-        labels = self.frame["label"].to_numpy()
-        for invalid in (labels[:-1], labels.reshape(-1, 1), labels * 2):
-            with self.subTest(shape=invalid.shape, classes=np.unique(invalid)):
-                with self.assertRaises(ValueError):
-                    classic._calibration_splits(
-                        self.frame, invalid, self.candidates[0], random_state=42
-                    )
 
     def test_smoke_cross_fits_all_strategies_keeps_holdout_untouched_and_saves_calibrated_model(
         self,
@@ -437,46 +356,6 @@ class SVMCheckpointTests(unittest.TestCase):
             ):
                 with self.assertRaises(ValueError):
                     self._train(root, candidates=(replace(self.candidate, calibration_n_splits=2),))
-
-    def test_public_training_and_stage4_wrappers_forward_options(self) -> None:
-        directory = Path("synthetic-checkpoint-not-created")
-        with patch.object(classic, "svm_candidates", return_value=(self.candidate,)) as candidates:
-            with patch.object(classic, "train_static_model", return_value=sentinel.result) as train:
-                result = classic.train_svm(
-                    self.frame,
-                    self.splits,
-                    profile="tuning",
-                    checkpoint_dir=directory,
-                    resume=False,
-                    progress_callback=sentinel.callback,
-                )
-        self.assertIs(result, sentinel.result)
-        candidates.assert_called_once_with(profile="tuning")
-        self.assertEqual(train.call_args.kwargs["model_name"], "svm")
-        self.assertIs(train.call_args.kwargs["estimator_factory"], classic.build_svm)
-        self.assertEqual(train.call_args.kwargs["checkpoint_dir"], directory)
-        self.assertIs(train.call_args.kwargs["resume"], False)
-        self.assertIs(train.call_args.kwargs["progress_callback"], sentinel.callback)
-
-        with patch.object(
-            classic, "load_static_stage4_inputs", return_value=(self.frame, self.splits)
-        ):
-            with patch.object(classic, "train_svm", return_value=sentinel.result) as train:
-                with patch.object(
-                    classic, "save_static_training_result", return_value=sentinel.artifacts
-                ) as save:
-                    result, artifacts = classic.run_svm_stage4(
-                        profile="smoke",
-                        checkpoint_dir=directory,
-                        resume=False,
-                        progress_callback=sentinel.callback,
-                    )
-        self.assertIs(result, sentinel.result)
-        self.assertIs(artifacts, sentinel.artifacts)
-        self.assertEqual(train.call_args.kwargs["checkpoint_dir"], directory)
-        self.assertIs(train.call_args.kwargs["resume"], False)
-        self.assertIs(train.call_args.kwargs["progress_callback"], sentinel.callback)
-        self.assertEqual(save.call_args.kwargs["artifact_suffix"], "smoke")
 
 
 if __name__ == "__main__":

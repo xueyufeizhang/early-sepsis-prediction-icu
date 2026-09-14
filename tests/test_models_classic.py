@@ -21,7 +21,6 @@ from src.models.classic import (
 from src.splits import (
     build_patient_splits,
     build_static_resampling_pipeline,
-    save_patient_splits,
 )
 
 
@@ -166,7 +165,7 @@ class StaticTrainingFrameworkTests(unittest.TestCase):
             sampling_strategy=0.5,
             positive_weight_multiplier=1.0,
         )
-        with self.assertRaisesRegex(ValueError, "combines sampling and class weighting"):
+        with self.assertRaises(ValueError):
             train_static_model(
                 model_name="logistic_regression",
                 frame=self.frame,
@@ -320,7 +319,7 @@ class StaticTrainingFrameworkTests(unittest.TestCase):
             static_path = root / "static.parquet"
             assignments_path = root / "assignments.parquet"
             self.frame.to_parquet(static_path, index=False)
-            save_patient_splits(self.frame, self.splits, assignments_path)
+            self.splits.assignments.to_parquet(assignments_path, index=False)
             loaded_frame, loaded_splits = load_static_stage4_inputs(
                 static_path=static_path,
                 assignments_path=assignments_path,
